@@ -1,0 +1,10 @@
+{
+  "id": "vault-commander",
+  "name": "Vault Commander",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "A blue, dual-panel orthodox file manager for your vault — inspired by classic DOS file commanders. Browse, copy, move, rename and preview notes and attachments in two panels.",
+  "author": "Andre Hessler",
+  "authorUrl": "https://github.com/typ127",
+  "isDesktopOnly": false
+}

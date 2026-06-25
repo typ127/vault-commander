@@ -1,0 +1,657 @@
+/* ============================================================
+   Vault Commander — the classic blue DOS file-manager look
+   ============================================================ */
+
+.nc-content {
+  --nc-blue:        #0000a8;
+  --nc-blue-d:      #000080;
+  --nc-cyan:        #00a8a8;
+  --nc-cyan-bright: #54fefe;
+  --nc-white:       #ffffff;
+  --nc-gray:        #b8b8c8;
+  --nc-yellow:      #fefe54;
+  --nc-black:       #000000;
+  --nc-font: "Px437 IBM VGA8", "PxPlus IBM VGA8", "Perfect DOS VGA 437",
+             "Consolas", "Cascadia Mono", "Menlo", "Courier New", monospace;
+  height: 100%;   /* anchor the height chain so .nc-list scrolls & the footer stays */
+}
+
+/* fill the leaf, kill default padding */
+.workspace-leaf-content[data-type="vault-commander-view"] .view-content {
+  padding: 0;
+  background: var(--nc-blue);
+  /* this is a flex item in the leaf; its default min-height:auto would let it
+     grow past the leaf when the list is long (footer/command line then get
+     clipped). Bound it to the leaf so .nc-list scrolls instead. */
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* fullscreen: the NC leaf covers the workspace, sidebars and ribbon … */
+.workspace-leaf.nc-fs {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 100 !important;
+}
+/* … but dialogs, menus and notices must still appear ON TOP of it */
+body.nc-fs-active .modal-container { z-index: 1000 !important; }
+body.nc-fs-active .menu,
+body.nc-fs-active .suggestion-container,
+body.nc-fs-active .notice-container { z-index: 1100 !important; }
+
+.nc-root {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--nc-blue);
+  color: var(--nc-gray);
+  font-family: var(--nc-font);
+  font-size: 15px;
+  line-height: 20px;
+  outline: none;
+  user-select: none;
+}
+/* black spacer so Obsidian's status bar (word/char count) stays clear,
+   instead of showing the blue panel background */
+.nc-bottompad {
+  flex: 0 0 48px;
+  background: #000;
+}
+
+/* ── panels ── */
+.nc-panels {
+  flex: 1 1 auto;
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  min-height: 0;
+}
+.nc-panel {
+  flex: 1 1 50%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 3px double var(--nc-cyan);
+  background: var(--nc-blue);
+  overflow: hidden;
+}
+.nc-panel.nc-active { border-color: var(--nc-cyan-bright); }
+
+.nc-panel-head {
+  text-align: center;
+  color: var(--nc-cyan-bright);
+  background: var(--nc-blue);
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;            /* truncate the long left part of the path */
+}
+.nc-panel.nc-active .nc-panel-head {
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+}
+
+.nc-colhead {
+  display: flex;
+  color: var(--nc-cyan-bright);
+  border-bottom: 1px solid var(--nc-cyan);
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.nc-colhead .nc-c-name { flex: 1 1 auto; }
+.nc-colhead .nc-c-size { width: 13ch; text-align: right; }
+.nc-colhead .nc-c-date { width: 15ch; text-align: right; padding-left: 1ch; }
+
+.nc-list {
+  flex: 1 1 auto;
+  min-height: 0;        /* scroll inside the list instead of pushing the footer out */
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 6px;
+}
+/* header, column header and footer must keep their height — they have
+   overflow:hidden (so their flex auto-min-height is 0) and would otherwise be
+   squashed to nothing once the list overflows */
+.nc-panel-head,
+.nc-colhead,
+.nc-panel-foot { flex-shrink: 0; }
+.nc-row {
+  display: flex;
+  white-space: nowrap;
+  color: var(--nc-gray);
+  cursor: default;
+}
+.nc-row .nc-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nc-row .nc-size { width: 13ch; text-align: right; }
+.nc-row .nc-date { width: 15ch; text-align: right; padding-left: 1ch; }
+
+.nc-row.nc-dir .nc-name { color: var(--nc-white); }      /* directories: bright white */
+.nc-row.nc-tagged { color: var(--nc-yellow); }            /* tagged: yellow */
+.nc-row.nc-tagged .nc-name { color: var(--nc-yellow); }
+
+/* cursor bar — only the ACTIVE panel shows the solid cyan highlight */
+.nc-panel.nc-active .nc-row.nc-cursor,
+.nc-panel.nc-active .nc-row.nc-cursor .nc-name {
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+}
+.nc-panel:not(.nc-active) .nc-row.nc-cursor {
+  background: rgba(84, 254, 254, 0.18);
+}
+
+.nc-panel-foot {
+  border-top: 1px solid var(--nc-cyan);
+  padding: 0 6px;
+  color: var(--nc-cyan-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── command line ── */
+.nc-cmdline {
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  background: var(--nc-blue);
+  color: var(--nc-white);
+  overflow: hidden;            /* never produce a horizontal scrollbar */
+}
+/* the cwd — truncates its long left part with an ellipsis, like a panel header */
+.nc-cmd-prompt {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  color: var(--nc-white);
+}
+.nc-cmd-sep { flex: 0 0 auto; white-space: pre; color: var(--nc-white); }
+.nc-cmd-input {
+  flex: 1 1 auto;
+  min-width: 0;                /* let the input shrink instead of overflowing */
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--nc-white);
+  font-family: var(--nc-font);
+  font-size: 15px;
+  padding: 0;
+  box-shadow: none !important;
+}
+
+/* ── function-key bar ── */
+.nc-fnbar {
+  display: flex;
+  gap: 1px;
+  padding: 2px 4px 4px;
+  background: var(--nc-blue);
+}
+.nc-fkey {
+  flex: 1 1 0;
+  display: flex;
+  min-width: 0;
+  cursor: pointer;
+  overflow: hidden;
+}
+.nc-fkey-num {
+  color: var(--nc-white);
+  padding: 0 2px;
+}
+.nc-fkey-label {
+  flex: 1 1 auto;
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+  padding: 0 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nc-fkey:hover .nc-fkey-label { background: var(--nc-cyan-bright); }
+
+/* ── scrollbar inside panels ── */
+.nc-list::-webkit-scrollbar { width: 8px; }
+.nc-list::-webkit-scrollbar-track { background: var(--nc-blue-d); }
+.nc-list::-webkit-scrollbar-thumb { background: var(--nc-cyan); }
+
+/* ============================================================
+   Modals — classic gray Turbo Vision dialogs
+   (rendered outside .nc-content, so colors are hard-coded here)
+   ============================================================ */
+/* non-modal: drop Obsidian's dark dimmed backdrop behind our dialogs */
+.modal-container:has(.modal.nc-modal) {
+  background-color: transparent !important;
+}
+.modal-container:has(.modal.nc-modal) .modal-bg {
+  background-color: transparent !important;
+  opacity: 0 !important;
+}
+.modal.nc-modal {
+  background: #aaaaaa;
+  border: 3px double #ffffff;
+  border-radius: 0;
+  color: #000;
+  font-family: "Px437 IBM VGA8", "Consolas", "Menlo", "Courier New", monospace;
+  /* hard, semi-transparent DOS drop-shadow: bottom-right, right ≈ 2× bottom */
+  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55) !important;   /* big hard DOS shadow, bottom-right */
+}
+.modal.nc-modal .modal-close-button { color: #000; }
+.nc-modal-danger { border-color: #fcfcfc; }
+
+.nc-modal-title {
+  text-align: center;
+  color: #000;
+  margin: 0 0 .7em;
+  font-size: 1.05em;
+  letter-spacing: 1px;
+}
+.nc-modal-danger .nc-modal-title { color: #a80000; }
+
+.nc-modal-body {
+  background: transparent;
+  color: #000;
+  white-space: pre-wrap;
+  border: none;
+  padding: 0;
+  margin: 0 0 1em;
+  font-family: inherit;
+}
+
+.nc-modal-input {
+  width: 100%;
+  background: #000080;
+  border: 1px solid #54fefe;
+  border-radius: 0;
+  color: #fefe54;
+  font-family: inherit;
+  font-size: 1em;
+  padding: 2px 6px;
+  margin-bottom: 1em;
+}
+
+.nc-modal-buttons {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+.nc-modal-buttons-wrap { flex-wrap: wrap; }
+/* classic Turbo Vision / NC dialog buttons: a green face with a hard
+   drop-shadow; the default button carries the « OK » selection markers */
+.nc-btn {
+  background: #00a800;
+  color: #000;
+  border: none;
+  border-radius: 0;
+  font-family: inherit;
+  font-size: 1em;
+  line-height: 1.25;
+  padding: 0 2ch;
+  cursor: pointer;
+  outline: none;
+  box-shadow: 3px 2px 0 0 rgba(0, 0, 0, 0.5);
+}
+.nc-btn:hover,
+.nc-btn:focus { background: #2adc2a; color: #000; }
+.nc-btn:active { box-shadow: 1px 1px 0 0 rgba(0, 0, 0, 0.5); transform: translate(2px, 1px); }
+
+/* the default button is drawn like NC's “‹ OK ›” */
+.nc-btn-default::before { content: '‹\00a0'; }
+.nc-btn-default::after  { content: '\00a0›'; }
+
+.nc-viewer { width: min(900px, 90vw); }
+.nc-viewer-pre,
+.nc-viewer-area {
+  width: 100%;
+  height: min(60vh, 600px);
+  background: #000080;
+  color: #fff;
+  border: 1px solid #54fefe;
+  border-radius: 0;
+  font-family: inherit;
+  font-size: .95em;
+  padding: 6px 8px;
+  overflow: auto;
+  white-space: pre;
+  margin: 0 0 1em;
+  resize: none;
+  outline: none;
+}
+.nc-viewer-pre:focus,
+.nc-viewer-md:focus { box-shadow: inset 0 0 0 1px #aaffff; }
+
+/* image preview */
+.nc-viewer-img {
+  width: 100%;
+  max-height: 70vh;
+  overflow: auto;
+  text-align: center;
+  background: #000080;
+  border: 1px solid #54fefe;
+  margin: 0 0 1em;
+  padding: 6px;
+}
+.nc-viewer-img img { max-width: 100%; height: auto; cursor: crosshair; }
+
+/* eyedropper readout that follows the cursor over an image (F3) */
+.nc-color-readout {
+  position: fixed;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #000;
+  color: #fff;
+  border: 1px solid #54fefe;
+  padding: 2px 6px;
+  font-family: "Px437 IBM VGA8", "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  pointer-events: none;   /* never intercept the image's mousemove */
+}
+.nc-color-swatch { width: 14px; height: 14px; border: 1px solid #fff; }
+.nc-color-hex { white-space: nowrap; }
+
+/* rendered markdown preview */
+.nc-viewer-md {
+  width: 100%;
+  max-height: min(65vh, 640px);
+  overflow: auto;
+  background: #000080;
+  color: #fff;
+  border: 1px solid #54fefe;
+  padding: 10px 16px;
+  margin: 0 0 1em;
+  outline: none;
+  font-family: var(--font-text, sans-serif);
+  white-space: normal;
+}
+.nc-viewer-md a { color: #aaffff; }
+.nc-viewer-md code, .nc-viewer-md pre {
+  background: #00005a;
+  color: #54fefe;
+  font-family: "Px437 IBM VGA8", "Consolas", "Menlo", monospace;
+}
+
+.nc-drive-list { display: flex; flex-direction: column; gap: 1px; }
+.nc-drive-item {
+  padding: 2px 8px;
+  color: #000;
+  cursor: pointer;
+}
+.nc-drive-item:hover { background: #00a8a8; color: #000; }
+
+/* ============================================================
+   Menus — F9 pulldown (top bar) and F2 user menu (centered box)
+   ============================================================ */
+.nc-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+}
+
+/* persistent docked menu bar (Options → "Hide menu" off): own row above the
+   panels, so it never overlaps a panel header. Empty (hidden mode) → no row. */
+.nc-topbar { flex: 0 0 auto; }
+.nc-topbar:empty { display: none; }
+/* its dropdown sits directly under the bar (the overlay is offset down by the
+   bar height, so the bar stays clickable) */
+.nc-dropdown.nc-dropdown-docked { top: 0; }   /* flush under the docked bar — no gap */
+
+/* F9 top menu bar — cyan with black text, like NC */
+.nc-menubar {
+  display: flex;
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+  padding: 0 4px;
+}
+.nc-menucat {
+  padding: 0 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.nc-menucat.nc-sel {
+  background: var(--nc-cyan-bright);
+  color: var(--nc-black);
+}
+
+/* dropdown body (F9) and centered box (F2): cyan box, black text,
+   selected item drawn as a black bar — the classic NC menu look */
+.nc-dropdown {
+  position: absolute;
+  top: 20px;
+  min-width: 240px;
+  background: var(--nc-cyan);
+  border: 1px solid var(--nc-black);
+  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55);
+  color: var(--nc-black);
+  padding: 1px 0;
+}
+.nc-usermenu {
+  position: absolute;
+  top: 28%;
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 300px;
+  background: var(--nc-cyan);
+  border: 1px solid var(--nc-black);
+  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55);
+  color: var(--nc-black);
+  padding-bottom: 1px;
+}
+.nc-usermenu-title {
+  text-align: center;
+  background: var(--nc-cyan-bright);
+  color: var(--nc-black);
+  margin-bottom: 1px;
+}
+.nc-menu-item {
+  padding: 0 14px;
+  white-space: pre;
+  cursor: pointer;
+  color: var(--nc-black);
+}
+.nc-menu-item.nc-sel {
+  background: var(--nc-black);
+  color: var(--nc-cyan-bright);
+}
+.nc-menu-sep {
+  border-top: 1px solid rgba(0, 0, 0, 0.45);
+  margin: 2px 6px;
+}
+
+/* ============================================================
+   Alternate panel views — Info / Tree / Quick view
+   (set per panel via the Links / Rechts pull-down menu)
+   ============================================================ */
+
+/* the Name/Size/Date column header only belongs to the file list */
+.nc-panel:not(.nc-mode-list) .nc-colhead { display: none; }
+
+/* ── Tree ── */
+.nc-tree-row {
+  display: flex;
+  white-space: pre;
+  color: var(--nc-white);
+  cursor: default;
+}
+.nc-tree-conn { color: var(--nc-cyan); white-space: pre; }
+.nc-tree-name { color: var(--nc-white); overflow: hidden; text-overflow: ellipsis; }
+.nc-panel.nc-active .nc-tree-row.nc-cursor,
+.nc-panel.nc-active .nc-tree-row.nc-cursor .nc-tree-name,
+.nc-panel.nc-active .nc-tree-row.nc-cursor .nc-tree-conn {
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+}
+.nc-panel:not(.nc-active) .nc-tree-row.nc-cursor {
+  background: rgba(84, 254, 254, 0.18);
+}
+
+/* ── Info ── */
+.nc-info { padding: 4px 8px; }
+.nc-info-banner {
+  text-align: center;
+  color: var(--nc-yellow);
+  border-bottom: 1px solid var(--nc-cyan);
+  padding-bottom: 4px;
+  margin-bottom: 6px;
+}
+.nc-info-box {
+  border-top: 1px solid var(--nc-cyan);
+  padding: 4px 0;
+}
+.nc-info-box:first-of-type { border-top: none; }
+.nc-info-line {
+  color: var(--nc-cyan-bright);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.nc-info-dim { color: var(--nc-gray); }
+.nc-info-dirinfo {
+  background: transparent;
+  border: none;
+  color: var(--nc-white);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* ── Quick view ── */
+.nc-quick-msg { padding: 8px; color: var(--nc-cyan-bright); white-space: pre-wrap; }
+.nc-quick-dir { padding: 8px; color: var(--nc-white); }
+.nc-quick-dir div { color: var(--nc-white); }
+.nc-quick-pre {
+  margin: 0;
+  padding: 4px 8px;
+  background: transparent;
+  border: none;
+  color: var(--nc-white);
+  white-space: pre;
+  font-family: inherit;
+  font-size: inherit;
+}
+.nc-quick-img { padding: 6px; text-align: center; }
+.nc-quick-img img { max-width: 100%; height: auto; }
+
+/* ── Wide layout: names only, flowing into multiple columns (NC "Wide") ── */
+.nc-panel.nc-layout-wide .nc-colhead { display: none; }
+.nc-panel.nc-layout-wide .nc-list {
+  flex: 1 1 0;        /* bound to the space between header and footer … */
+  min-height: 0;      /* … so columns wrap instead of pushing the footer off */
+  column-width: 18ch;
+  column-gap: 2ch;
+  column-fill: auto;
+  column-rule: 1px solid var(--nc-cyan);   /* vertical dividers between columns */
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.nc-panel.nc-layout-wide .nc-row { display: block; break-inside: avoid; }
+.nc-panel.nc-layout-wide .nc-row .nc-name { display: block; width: auto; }
+
+/* ── Bookmarks & recent folders picker (Ctrl+D) ── */
+.nc-hotlist { max-height: 50vh; overflow-y: auto; margin: 0 0 .6em; }
+.nc-hotlist-head { color: #006e6e; border-bottom: 1px solid #888; margin: 6px 0 2px; padding: 0 4px; }
+.nc-hotlist-note { color: #555; padding: 0 8px; }
+.nc-hotlist-item {
+  padding: 1px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #000;
+}
+.nc-hotlist-item.nc-sel { background: #00a8a8; color: #000; }
+.nc-hotlist-num { display: inline-block; width: 1.4em; text-align: right; margin-right: .5em; color: #006e6e; font-weight: bold; }
+.nc-hotlist-item.nc-sel .nc-hotlist-num { color: #000; }
+.nc-hotlist-hint { color: #333; font-size: .82em; text-align: center; }
+
+/* ============================================================
+   Theme 2 — gray "DOS Navigator" palette
+   (toggled in the F9 → Options menu / settings; adds .nc-theme-gray)
+   Only the main view changes; dialogs stay gray in both themes.
+   ============================================================ */
+.nc-content.nc-theme-gray {
+  --nc-blue:        #555555;   /* desktop / panel background → dark gray (DN, 0x55) */
+  --nc-blue-d:      #3c3c3c;   /* recessed areas */
+  --nc-cyan:        #00a8a8;   /* active header + cursor bar */
+  --nc-cyan-bright: #54fefe;
+  --nc-white:       #ffffff;   /* directory names → bright white */
+  --nc-gray:        #e2e2e2;   /* file names → light gray */
+  --nc-yellow:      #fcfc54;   /* tagged + column headers */
+  --nc-black:       #000000;   /* text on cyan highlights */
+}
+/* panel frames: light on the darker gray; active = bright white */
+.nc-content.nc-theme-gray .nc-panel { border-color: #c8c8c8; }
+.nc-content.nc-theme-gray .nc-panel.nc-active { border-color: #ffffff; }
+/* inactive header: white text on gray (active panel keeps the cyan bar) */
+.nc-content.nc-theme-gray .nc-panel:not(.nc-active) .nc-panel-head { color: #fff; }
+/* column headers: yellow, like DOS Navigator */
+.nc-content.nc-theme-gray .nc-colhead { color: var(--nc-yellow); border-bottom-color: #c8c8c8; }
+/* footer: bright cyan on the dark gray */
+.nc-content.nc-theme-gray .nc-panel-foot { color: var(--nc-cyan-bright); border-top-color: #c8c8c8; }
+/* tagged files: yellow (readable on the darker gray) */
+.nc-content.nc-theme-gray .nc-row.nc-tagged,
+.nc-content.nc-theme-gray .nc-row.nc-tagged .nc-name { color: var(--nc-yellow); }
+/* command line: light text on gray */
+.nc-content.nc-theme-gray .nc-cmd-prompt,
+.nc-content.nc-theme-gray .nc-cmd-sep,
+.nc-content.nc-theme-gray .nc-cmd-input { color: #fff; }
+/* function-key bar: black like DN; numbers stay light */
+.nc-content.nc-theme-gray .nc-fnbar { background: #000; }
+.nc-content.nc-theme-gray .nc-fkey-num { color: #fff; }
+/* wide column dividers a touch lighter on gray */
+.nc-content.nc-theme-gray .nc-panel.nc-layout-wide .nc-list { column-rule-color: #c8c8c8; }
+/* panel scrollbar */
+.nc-content.nc-theme-gray .nc-list::-webkit-scrollbar-track { background: #3c3c3c; }
+.nc-content.nc-theme-gray .nc-list::-webkit-scrollbar-thumb { background: #00a8a8; }
+/* menus: lighter gray boxes on the darker desktop, cyan selection (DN) */
+.nc-content.nc-theme-gray .nc-menubar { background: #b4b4b4; }
+.nc-content.nc-theme-gray .nc-menucat.nc-sel { background: #00a8a8; color: #000; }
+.nc-content.nc-theme-gray .nc-dropdown,
+.nc-content.nc-theme-gray .nc-usermenu { background: #b4b4b4; color: #000; border-color: #000; }
+.nc-content.nc-theme-gray .nc-usermenu-title { background: #00a8a8; color: #000; }
+.nc-content.nc-theme-gray .nc-menu-item { color: #000; }
+.nc-content.nc-theme-gray .nc-menu-item.nc-sel { background: #00a8a8; color: #000; }
+.nc-content.nc-theme-gray .nc-menu-sep { border-top-color: rgba(0, 0, 0, 0.4); }
+/* tree connectors / names on gray */
+.nc-content.nc-theme-gray .nc-tree-row,
+.nc-content.nc-theme-gray .nc-tree-name { color: #fff; }
+.nc-content.nc-theme-gray .nc-tree-conn { color: var(--nc-cyan-bright); }
+/* Info / Quick view text on gray */
+.nc-content.nc-theme-gray .nc-info-line { color: var(--nc-cyan-bright); }
+.nc-content.nc-theme-gray .nc-info-banner { color: var(--nc-yellow); border-bottom-color: #c8c8c8; }
+.nc-content.nc-theme-gray .nc-info-box { border-top-color: #c8c8c8; }
+.nc-content.nc-theme-gray .nc-info-dim { color: #d0d0d0; }
+.nc-content.nc-theme-gray .nc-info-dirinfo,
+.nc-content.nc-theme-gray .nc-quick-pre,
+.nc-content.nc-theme-gray .nc-quick-dir,
+.nc-content.nc-theme-gray .nc-quick-dir div { color: #fff; }
+.nc-content.nc-theme-gray .nc-quick-msg { color: var(--nc-cyan-bright); }
+
+/* ============================================================
+   Secret screen (type "xyzzy" on the command line)
+   ============================================================ */
+.modal.nc-egg { background: #0000a8; border-color: #54fefe; color: #fff; }
+.modal.nc-egg .nc-modal-title { color: #fefe54; }
+.nc-egg-art {
+  background: transparent;
+  border: none;
+  margin: 0 0 1em;
+  padding: 0;
+  color: #54fefe;
+  text-align: center;
+  white-space: pre;
+  font-family: "Px437 IBM VGA8", "Consolas", "Menlo", monospace;
+  line-height: 1.2;
+}
+.nc-egg-cursor { color: #fff; animation: nc-blink 1s steps(1, end) infinite; }
+@keyframes nc-blink { 50% { opacity: 0; } }
