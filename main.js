@@ -6,7 +6,7 @@
  * Hand-written CommonJS (no build step). Desktop only.
  * ============================================================ */
 
-const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope, Platform, normalizePath } = require('obsidian');
+const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope, Platform, normalizePath, Component } = require('obsidian');
 // Node's `path` exists on desktop (Electron) but NOT on mobile — there is no Node
 // runtime there, so `require('path')` is unavailable. The plus/Node build needs the
 // real module for OS-correct paths; the vault build (which is what runs on mobile)
@@ -76,6 +76,9 @@ function fmtDate(ms) {
   return `${pad2(d.getDate())}.${pad2(d.getMonth() + 1)}.${String(d.getFullYear()).slice(2)}` +
     `  ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
+
+// Node's `process` global is absent on mobile — guard with typeof (evaluated once).
+const IS_WINDOWS = typeof process !== 'undefined' && !!process.platform && process.platform === 'win32';
 
 function isRoot(dir) { return path.dirname(dir) === dir; }
 
@@ -251,8 +254,19 @@ class VaultProvider {
   async readBinary(p) { return this.adapter.readBinary(this.norm(p)); }
   async write(p, text) { await this.adapter.write(this.norm(p), text); }
   async writeBinary(p, data) { await this.adapter.writeBinary(this.norm(p), data); }
-  async mkdir(p) { const n = this.norm(p); if (n !== '/' && !(await this.adapter.exists(n))) await this.adapter.mkdir(n); }
-  async rmdir(p) { await this.adapter.rmdir(this.norm(p), true); }
+  // idempotent for an existing folder (so merge copy/move works), but a file of
+  // the same name is a real conflict → throw (matches fs.mkdirSync semantics).
+  async mkdir(p) {
+    const n = this.norm(p);
+    if (n === '/') return;
+    const s = await this.adapter.stat(n);
+    if (s) { if (s.type === 'folder') return; throw new Error('a file with that name already exists'); }
+    await this.adapter.mkdir(n);
+  }
+  // non-recursive (like fs.rmdirSync): throws on a non-empty folder, so the
+  // move cleanup correctly keeps folders whose files the user chose to skip.
+  // (Recursive deletion goes through remove() below.)
+  async rmdir(p) { await this.adapter.rmdir(this.norm(p), false); }
   async rename(a, b) { await this.adapter.rename(this.norm(a), this.norm(b)); }
 
   async remove(p) {
@@ -277,6 +291,10 @@ class VaultProvider {
   }
 
   async move(src, dst) {
+    // overwrite cleanly (like FsProvider): the adapter's rename rejects an
+    // existing target, so drop it first — otherwise the fallback copy+remove
+    // could leave the source behind as a duplicate.
+    if (await this.adapter.exists(this.norm(dst))) await this.remove(dst);
     try { await this.adapter.rename(this.norm(src), this.norm(dst)); }
     catch (_) { await this.copy(src, dst); await this.remove(src); }
   }
@@ -370,6 +388,7 @@ class NCView extends ItemView {
 
   async onClose() {
     this.popMenuScope();
+    window.clearTimeout(this._qsTimer);   // don't let the quick-filter timer fire into detached DOM
     document.body.classList.remove('nc-fs-active');
     const leafEl = this.containerEl.closest('.workspace-leaf');
     if (leafEl) leafEl.classList.remove('nc-fs');
@@ -465,12 +484,13 @@ class NCView extends ItemView {
       // ignore the click the browser synthesizes right after a long-press tag
       if (this._tagPressAt && Date.now() - this._tagPressAt < 600) { this._tagPressAt = 0; return; }
       const i = parseInt(row.dataset.i, 10);
-      // Mobile has no reliable dblclick: a tap moves the cursor; tapping the row
-      // that is already selected (in the already-active panel) opens it.
-      const reTap = Platform.isMobile && this.active === p && p.cursor === i;
+      // Mobile has no reliable dblclick: a tap selects the row; tapping the row
+      // you just tapped opens it. tapRow (not cursor) gates this, so the default
+      // cursor position after navigating in does NOT count as a first tap.
+      const reTap = Platform.isMobile && this.active === p && p.tapRow === i;
       this.active = p;
-      if (reTap) { this.openEntry(); return; }
-      p.cursor = i;
+      if (reTap) { p.tapRow = -1; this.openEntry(); return; }
+      p.cursor = i; p.tapRow = i;
       this.refreshMarks(this.left); this.refreshMarks(this.right); this.renderCmd();
     });
     p.listEl.addEventListener('dblclick', (e) => {
@@ -555,6 +575,7 @@ class NCView extends ItemView {
 
   // dispatch to the right renderer based on the panel's view mode
   renderPanel(p) {
+    p.tapRow = -1;   // any full re-render (navigation/sort/toggle) disarms mobile tap-to-open
     p.el.classList.remove('nc-mode-list', 'nc-mode-info', 'nc-mode-tree', 'nc-mode-quick');
     p.el.classList.add('nc-mode-' + p.mode);
     p.el.toggleClass('nc-layout-wide', p.mode === 'list' && p.layout === 'wide');
@@ -631,7 +652,7 @@ class NCView extends ItemView {
 
   renderCmd() {
     if (!this.cmdInput) return;   // no command line in the vault build
-    const sep = process.platform === 'win32' ? '>' : '$';
+    const sep = IS_WINDOWS ? '>' : '$';
     // a passive (info/quick) panel has no meaningful cwd of its own — show the file panel's
     const p = (this.active.mode === 'list' || this.active.mode === 'tree') ? this.active : (this.workPanel() || this.active);
     this.cmdPrompt.setText(this.dispPath(p.cwd));
@@ -1209,12 +1230,14 @@ the bar at the bottom is clickable and always works.`);
       validate: (name) => invalidNameReason(name),
       onSubmit: async (name) => {
         if (!name) return;
+        const full = this.P.join(wp.cwd, name);
         try {
-          await this.fp.mkdir(this.P.join(wp.cwd, name));
+          if (await this.fp.exists(full)) { new Notice('Already exists: ' + name); return; }
+          await this.fp.mkdir(full);
           await this.refresh();
           const idx = wp.entries.findIndex((e) => e.name === name);
           if (idx >= 0) { wp.cursor = idx; this.renderPanel(wp); }
-        } catch (e) { new Notice('Fehler: ' + e.message); }
+        } catch (e) { new Notice('Error: ' + e.message); }
       },
     }).open();
   }
@@ -1655,11 +1678,12 @@ the bar at the bottom is clickable and always works.`);
 
   /* ── fullscreen: make the NC leaf fill the whole Obsidian window ── */
   setFullscreen(on) {
-    const leafEl = this.containerEl.closest('.workspace-leaf');
-    if (!leafEl) return;
+    // set the flag unconditionally so toggle/summon logic never desyncs, even if
+    // the leaf element isn't attached yet; apply the leaf class when it is.
     this.fullscreen = !!on;
-    leafEl.classList.toggle('nc-fs', this.fullscreen);
     document.body.classList.toggle('nc-fs-active', this.fullscreen);
+    const leafEl = this.containerEl.closest('.workspace-leaf');
+    if (leafEl) leafEl.classList.toggle('nc-fs', this.fullscreen);
     this.focusView();
   }
   toggleFullscreen() { this.setFullscreen(!this.fullscreen); }
@@ -1890,7 +1914,7 @@ the bar at the bottom is clickable and always works.`);
 
   volumeLabel(dir) {
     if (!this.fp.capabilities.absolutePaths) return 'vault';
-    if (process.platform === 'win32') return this.P.root(dir).replace(/\\$/, '');
+    if (IS_WINDOWS) return this.P.root(dir).replace(/\\$/, '');
     const m = /^\/Volumes\/([^/]+)/.exec(dir);
     return m ? m[1] : '/';
   }
@@ -2386,7 +2410,11 @@ class ViewerModal extends Modal {
       const div = contentEl.createDiv({ cls: 'nc-viewer-md markdown-rendered' });
       div.tabIndex = 0;
       const src = this.opts.sourcePath || '';
-      const comp = this.opts.component || this;
+      // own a per-modal Component so the rendered markdown's child renderers /
+      // embeds / observers are torn down when THIS modal closes (not when the
+      // long-lived Commander view does)
+      const comp = this._mdComp = new Component();
+      comp.load();
       if (MarkdownRenderer && MarkdownRenderer.render) MarkdownRenderer.render(this.app, this.opts.markdown, div, src, comp);
       else if (MarkdownRenderer && MarkdownRenderer.renderMarkdown) MarkdownRenderer.renderMarkdown(this.opts.markdown, div, src, comp);
       else div.setText(this.opts.markdown);
@@ -2457,6 +2485,7 @@ class ViewerModal extends Modal {
       window.visualViewport.removeEventListener('scroll', this._vvFit);
       this._vvFit = null;
     }
+    if (this._mdComp) { this._mdComp.unload(); this._mdComp = null; }
     this.contentEl.empty();
   }
 }
@@ -2593,6 +2622,7 @@ class HotlistModal extends Modal {
 class NCSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
   display() {
+    if (this._recordStop) this._recordStop();   // cancel a pending hotkey recorder before re-rendering (e.g. Reset button)
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl('h2', { text: VC_NAME });
