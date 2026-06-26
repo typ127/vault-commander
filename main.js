@@ -57,6 +57,7 @@ const DEFAULTS = {
   maxViewMB: 5,     // viewer (F3) text/code size cap in MB; quick-view text = 1/10 of this (capped at 1 MB)
   maxEditMB: 2,     // internal editor (F4) size cap in MB (editing is heavier than read-only viewing)
   maxImageMB: 32,   // image preview size cap in MB (viewer + quick view)
+  openFullscreen: true,   // vault build / mobile: open the commander in fullscreen from the ribbon
   wrapText: false,  // wrap long lines in the text viewer / quick view (off = horizontal scroll)
   fullscreenHotkey: { meta: true, ctrl: false, alt: false, shift: false, key: 'F12' },
 };
@@ -381,8 +382,8 @@ class NCView extends ItemView {
     }
     this.renderAll();
     // mobile: fill the whole screen by default (Obsidian's header/tab chrome
-    // otherwise eats space); the user can still toggle it off via the menu / F10
-    if (Platform.isMobile) window.setTimeout(() => this.setFullscreen(true), 0);
+    // otherwise eats space); respects the setting and is still toggleable (menu / F10)
+    if (Platform.isMobile && this.plugin.settings.openFullscreen) window.setTimeout(() => this.setFullscreen(true), 0);
     window.setTimeout(() => this.focusView(), 0);
   }
 
@@ -2678,6 +2679,13 @@ class NCSettingTab extends PluginSettingTab {
           .onChange(async (v) => { this.plugin.settings.enableExec = v; await this.plugin.saveSettings(); }));
     }
 
+    if (VC_PROVIDER === 'vault' || Platform.isMobile) {
+      new Setting(containerEl).setName(VC_NAME + ' opens in fullscreen')
+        .setDesc('Open the commander filling the whole window when launched from the ribbon (F10 / the menu still toggles it).')
+        .addToggle((t) => t.setValue(this.plugin.settings.openFullscreen)
+          .onChange(async (v) => { this.plugin.settings.openFullscreen = v; await this.plugin.saveSettings(); }));
+    }
+
     new Setting(containerEl).setName('Theme')
       .setDesc('Color scheme: Commander Blue or Navigator Gray.')
       .addDropdown((d) => d
@@ -2772,10 +2780,19 @@ class VaultCommanderPlugin extends Plugin {
 
   async activateView() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_NC);
-    if (existing.length) { this.app.workspace.revealLeaf(existing[0]); return; }
-    const leaf = this.app.workspace.getLeaf(true);
-    await leaf.setViewState({ type: VIEW_TYPE_NC, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    let leaf;
+    if (existing.length) {
+      leaf = existing[0];
+      this.app.workspace.revealLeaf(leaf);
+    } else {
+      leaf = this.app.workspace.getLeaf(true);
+      await leaf.setViewState({ type: VIEW_TYPE_NC, active: true });
+      this.app.workspace.revealLeaf(leaf);
+    }
+    // the vault variant (and any mobile build) opens fullscreen from the ribbon
+    // unless the user turned it off — apply whether the leaf is new or revealed
+    // (onOpen only runs for a freshly created view). Plus/desktop opens as a tab.
+    if (this.settings.openFullscreen && (VC_PROVIDER === 'vault' || Platform.isMobile) && leaf.view && leaf.view.setFullscreen) leaf.view.setFullscreen(true);
   }
 
   // quick open/show in fullscreen: open if closed, reveal if hidden, pop out if already here
