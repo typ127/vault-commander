@@ -6,8 +6,31 @@
  * Hand-written CommonJS (no build step). Desktop only.
  * ============================================================ */
 
-const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope, Platform } = require('obsidian');
-const path = require('path');   // pure string utility (no filesystem access) — used by both backends
+const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope, Platform, normalizePath } = require('obsidian');
+// Node's `path` exists on desktop (Electron) but NOT on mobile — there is no Node
+// runtime there, so `require('path')` is unavailable. The plus/Node build needs the
+// real module for OS-correct paths; the vault build (which is what runs on mobile)
+// only ever deals with POSIX, vault-relative paths, so a tiny pure-JS POSIX fallback
+// is exact there. Either way `path` is always a usable object.
+let path;
+try { path = require('path'); } catch (_) { /* no Node on mobile */ }
+if (!path || typeof path.extname !== 'function') {
+  const str = (p) => String(p == null ? '' : p);
+  path = {
+    sep: '/',
+    join(...a) {
+      const j = a.filter((s) => s != null && s !== '').join('/').replace(/\/{2,}/g, '/');
+      return j === '' ? '.' : j;
+    },
+    resolve(...a) { return path.join(...a); },
+    dirname(p) { p = str(p).replace(/\/+$/, ''); const i = p.lastIndexOf('/'); return i < 0 ? '.' : (i === 0 ? '/' : p.slice(0, i)); },
+    basename(p) { p = str(p).replace(/\/+$/, ''); const i = p.lastIndexOf('/'); return i < 0 ? p : p.slice(i + 1); },
+    extname(p) { const b = path.basename(p); const i = b.lastIndexOf('.'); return i <= 0 ? '' : b.slice(i); },
+    relative(a, b) { return str(b); },
+    isAbsolute(p) { return str(p).startsWith('/'); },
+    parse(p) { return { root: str(p).startsWith('/') ? '/' : '' }; },
+  };
+}
 
 const VC_NAME = "Vault Commander";                  /* @variant:name */
 const VIEW_TYPE_NC = "vault-commander-view";        /* @variant:viewtype */
@@ -20,6 +43,8 @@ const DEFAULTS = {
   rightMode: 'list',
   leftSort: 'name',   // name | ext | time | size | unsorted
   rightSort: 'name',
+  leftSortAsc: true,  // sort direction (true = ascending a..z / oldest / smallest)
+  rightSortAsc: true,
   leftLayout: 'full', // full | wide
   rightLayout: 'full',
   theme: 'blue',      // blue (Commander Blue) | gray (Navigator Gray)
@@ -29,6 +54,10 @@ const DEFAULTS = {
   confirmCopy: true,
   enableExec: true,
   showHidden: true,
+  maxViewMB: 5,     // viewer (F3) text/code size cap in MB; quick-view text = 1/10 of this (capped at 1 MB)
+  maxEditMB: 2,     // internal editor (F4) size cap in MB (editing is heavier than read-only viewing)
+  maxImageMB: 32,   // image preview size cap in MB (viewer + quick view)
+  wrapText: false,  // wrap long lines in the text viewer / quick view (off = horizontal scroll)
   fullscreenHotkey: { meta: true, ctrl: false, alt: false, shift: false, key: 'F12' },
 };
 
@@ -60,17 +89,37 @@ function mimeFor(name) {
   }[ext] || 'application/octet-stream';
 }
 
-// base64-encode bytes without Node's Buffer, so the vault build runs on mobile too.
-// Accepts a Buffer, Uint8Array or ArrayBuffer; chunked to stay under arg-count limits.
-function toBase64(data) {
+// turn raw bytes into a `data:` URL using the platform's own base64 encoder
+// (FileReader). This avoids String.fromCharCode.apply, which throws on mobile
+// engines (iOS/JavaScriptCore) for large argument counts. Works on desktop and
+// mobile, for any image size. Accepts a Buffer, Uint8Array or ArrayBuffer.
+function bytesToDataURL(data, mime) {
   const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
-  let bin = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < u8.length; i += chunk) bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
-  return btoa(bin);
+  const blob = new Blob([u8], { type: mime || 'application/octet-stream' });
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(fr.error || new Error('FileReader failed'));
+    fr.readAsDataURL(blob);
+  });
 }
 
 function nameCompare(a, b) { return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }); }
+
+// validate a new file/folder name; returns an error string, or null if OK.
+// Rejects path separators and characters illegal on common filesystems / in the
+// Obsidian vault, plus reserved and trailing-space/dot names (Windows).
+function invalidNameReason(name) {
+  const n = String(name == null ? '' : name);
+  if (!n.trim()) return 'Name must not be empty.';
+  if (n === '.' || n === '..') return 'That name is reserved.';
+  if (/[\\/]/.test(n)) return 'Name must not contain slashes ( / \\ ).';
+  if (/[:*?"<>|]/.test(n)) return 'Name must not contain : * ? " < > |';
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f]/.test(n)) return 'Name must not contain control characters.';
+  if (/[ .]$/.test(n)) return 'Name must not end with a space or a dot.';
+  return null;
+}
 
 function hotkeyLabel(hk) {
   if (!hk || !hk.key) return '';
@@ -158,7 +207,9 @@ class VaultProvider {
   get capabilities() { return { exec: false, drives: false, archives: false, freeSpace: false, absolutePaths: false }; }
 
   // adapter expects '/' for the vault root and slash-free relative paths elsewhere
-  norm(p) { const s = String(p || '').replace(/^\/+|\/+$/g, ''); return s === '' ? '/' : s; }
+  // use Obsidian's normalizePath (collapses //, strips leading/trailing /, fixes \).
+  // adapter calls want a relative path; root is '/'.
+  norm(p) { const s = normalizePath(String(p == null ? '' : p)); return (!s || s === '.') ? '/' : s; }
   homeDir() { return ''; }
 
   async list(dir, showHidden) {
@@ -286,8 +337,9 @@ class NCView extends ItemView {
     const dir = cwd || this.fp.homeDir();
     const mode = this.plugin.settings[side + 'Mode'] || 'list';
     const sortKey = this.plugin.settings[side + 'Sort'] || 'name';
+    const sortAsc = this.plugin.settings[side + 'SortAsc'] !== false;
     const layout = this.plugin.settings[side + 'Layout'] || 'full';
-    return { side, cwd: dir, mode, sortKey, layout, tree: null, zip: null, entries: [], cursor: 0, tagged: new Set(), searchBuf: '', searchTime: 0, renderSeq: 0, el: null, listEl: null, headEl: null, footEl: null };
+    return { side, cwd: dir, mode, sortKey, sortAsc, layout, tree: null, zip: null, entries: [], cursor: 0, tagged: new Set(), searchBuf: '', searchTime: 0, renderSeq: 0, el: null, listEl: null, headEl: null, footEl: null };
   }
 
   // fall back to home if a saved directory is no longer reachable
@@ -310,6 +362,9 @@ class NCView extends ItemView {
       if (o.mode === 'list' || o.mode === 'tree') this.active = o;
     }
     this.renderAll();
+    // mobile: fill the whole screen by default (Obsidian's header/tab chrome
+    // otherwise eats space); the user can still toggle it off via the menu / F10
+    if (Platform.isMobile) window.setTimeout(() => this.setFullscreen(true), 0);
     window.setTimeout(() => this.focusView(), 0);
   }
 
@@ -371,9 +426,6 @@ class NCView extends ItemView {
       b.addEventListener('click', (e) => { e.preventDefault(); this.focusView(); fn(); });
     }
 
-    // black spacer so the OS / Obsidian status bar area isn't blue
-    root.createDiv({ cls: 'nc-bottompad' });
-
     this.renderTopbar();   // show the docked menu bar if "Hide menu" is off
 
     // events
@@ -388,10 +440,21 @@ class NCView extends ItemView {
   buildPanel(parent, p) {
     const el = parent.createDiv({ cls: 'nc-panel' });
     p.headEl = el.createDiv({ cls: 'nc-panel-head' });
+    // clicking the path header opens the bookmarks dialog for this panel
+    p.headEl.addEventListener('click', (e) => { e.stopPropagation(); this.setActive(p); this.openHotlist(); });
     const colhead = el.createDiv({ cls: 'nc-colhead' });
     p.colName = colhead.createSpan({ cls: 'nc-c-name', text: 'Name' });
     p.colSize = colhead.createSpan({ cls: 'nc-c-size', text: 'Size' });
     p.colDate = colhead.createSpan({ cls: 'nc-c-date', text: 'Date' });
+    // click a column header to sort by it; click the active column again to flip direction
+    const sortOnClick = (el, key) => el.addEventListener('click', (e) => {
+      e.stopPropagation(); this.setActive(p);
+      // the Name column keeps its current name/ext key; clicking it toggles direction
+      this.setSort(p, (key === 'name' && p.sortKey === 'ext') ? 'ext' : key);
+    });
+    sortOnClick(p.colName, 'name');
+    sortOnClick(p.colSize, 'size');
+    sortOnClick(p.colDate, 'time');
     p.listEl = el.createDiv({ cls: 'nc-list' });
     p.footEl = el.createDiv({ cls: 'nc-panel-foot' });
 
@@ -399,6 +462,8 @@ class NCView extends ItemView {
     p.listEl.addEventListener('click', (e) => {
       const row = e.target.closest('.nc-row');
       if (!row) return;
+      // ignore the click the browser synthesizes right after a long-press tag
+      if (this._tagPressAt && Date.now() - this._tagPressAt < 600) { this._tagPressAt = 0; return; }
       const i = parseInt(row.dataset.i, 10);
       // Mobile has no reliable dblclick: a tap moves the cursor; tapping the row
       // that is already selected (in the already-active panel) opens it.
@@ -416,7 +481,37 @@ class NCView extends ItemView {
       p.cursor = parseInt(row.dataset.i, 10);
       this.openEntry();
     });
+    // Mobile: long-press (500ms) on a row = Space (tag it; for folders also compute
+    // the size). Gives multi-select + folder size without a swipe, which Obsidian
+    // reserves for opening side panels. Passive listeners; a small move cancels it
+    // so scrolling still works.
+    if (Platform.isMobile) {
+      let timer = null, sx = 0, sy = 0;
+      const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
+      p.listEl.addEventListener('touchstart', (e) => {
+        const row = e.target.closest('.nc-row');
+        if (!row) return;
+        const t = e.touches[0]; sx = t.clientX; sy = t.clientY;
+        const i = parseInt(row.dataset.i, 10);
+        cancel();
+        timer = setTimeout(() => { timer = null; this._tagPressAt = Date.now(); this.longPressTag(p, i); }, 500);
+      }, { passive: true });
+      p.listEl.addEventListener('touchmove', (e) => {
+        const t = e.touches[0];
+        if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) cancel();
+      }, { passive: true });
+      p.listEl.addEventListener('touchend', cancel, { passive: true });
+      p.listEl.addEventListener('touchcancel', cancel, { passive: true });
+    }
     return el;
+  }
+
+  // long-press handler: select the row and toggle its tag (same as Space)
+  async longPressTag(p, i) {
+    const en = p.entries[i];
+    if (!en || en.up) return;
+    this.setActive(p); p.cursor = i;
+    await this.toggleTag();
   }
 
   /* ── data ── */
@@ -447,6 +542,8 @@ class NCView extends ItemView {
     this.plugin.settings.rightMode = this.right.mode;
     this.plugin.settings.leftSort = this.left.sortKey;
     this.plugin.settings.rightSort = this.right.sortKey;
+    this.plugin.settings.leftSortAsc = this.left.sortAsc;
+    this.plugin.settings.rightSortAsc = this.right.sortAsc;
     this.plugin.settings.leftLayout = this.left.layout;
     this.plugin.settings.rightLayout = this.right.layout;
     this.plugin.saveSettings();
@@ -469,7 +566,7 @@ class NCView extends ItemView {
 
   // full rebuild of a panel's rows — used on load / refresh / dir change
   renderListPanel(p) {
-    p.headEl.setText(p.zip ? `${p.zip.path} ▸ /${p.zip.prefix.replace(/\/$/, '')}` : (p.cwd || '/'));
+    p.headEl.setText(p.zip ? `${p.zip.path} ▸ /${p.zip.prefix.replace(/\/$/, '')}` : this.dispPath(p.cwd));
     this.updateColHead(p);
     const wide = p.layout === 'wide';
     p.listEl.empty();
@@ -537,7 +634,7 @@ class NCView extends ItemView {
     const sep = process.platform === 'win32' ? '>' : '$';
     // a passive (info/quick) panel has no meaningful cwd of its own — show the file panel's
     const p = (this.active.mode === 'list' || this.active.mode === 'tree') ? this.active : (this.workPanel() || this.active);
-    this.cmdPrompt.setText(p.cwd || '/');
+    this.cmdPrompt.setText(this.dispPath(p.cwd));
     this.cmdSep.setText(` ${sep} `);
   }
 
@@ -654,7 +751,9 @@ class NCView extends ItemView {
       // compute the recursive content size of a tagged folder, show it in the Size column
       if (en.isDir) await this.computeDirSize(p, en);
     }
-    p.cursor = Math.min(p.entries.length - 1, p.cursor + 1);
+    // desktop advances to the next row (rapid Space-tagging); on mobile the
+    // long-press should leave the cursor on the row you just marked.
+    if (!Platform.isMobile) p.cursor = Math.min(p.entries.length - 1, p.cursor + 1);
     this.renderPanel(p);
   }
 
@@ -703,6 +802,15 @@ class NCView extends ItemView {
     const rel = this.P.relative(base, full);
     if (rel.startsWith('..') || this.P.isAbsolute(rel)) return null;
     return rel.split(this.P.sep).join('/');
+  }
+
+  // human-readable path for headers / prompts. Vault paths are shown rooted
+  // ("/", "/Ordner1/ABC") so the vault feels like a self-contained root;
+  // absolute (node) paths are shown as-is.
+  dispPath(p) {
+    if (this.fp.capabilities.absolutePaths) return p || '/';
+    const s = this.P.join(p || '');
+    return s ? '/' + s : '/';
   }
 
   /* ── keyboard ── */
@@ -798,6 +906,16 @@ class NCView extends ItemView {
   actHelp() {
     const cap = this.fp.capabilities;
     const sections = [];
+    if (Platform.isMobile) sections.push(
+`VAULT COMMANDER — Touch gestures
+
+  Tap a row . . . . . . select it (move the cursor)
+  Tap it again  . . . . open: enter the folder / view the file
+  Long-press a row  . . mark it (= Space). Folders also show their size.
+                        Long-press several rows to multi-select for Copy / Move.
+  Tap the path header . open the bookmarks dialog for that panel
+  Bottom F-key bar  . . tap F1–F10 to run those actions
+  Bookmarks . . . . . . tap an entry to go there; the red ✕ removes it.`);
     sections.push(
 `VAULT COMMANDER — Keyboard
 
@@ -841,11 +959,19 @@ class NCView extends ItemView {
     if (cap.exec) sections.push(
 `  Command line at the bottom: 'cd <path>' changes the active panel,
   any other command runs in the current directory.`);
-    sections.push(
+    if (!Platform.isMobile) sections.push(
 `Note: on macOS the function keys may be claimed by the system —
 the bar at the bottom is clickable and always works.`);
     new ViewerModal(this.app, { title: 'Help', content: sections.join('\n\n') }).open();
   }
+
+  // viewer size limits (MB in settings → bytes), with a safe fallback if mis-set.
+  // Quick view uses a fraction of the viewer limit (capped) so the live preview
+  // stays responsive as the cursor moves.
+  viewLimit()  { const mb = Number(this.plugin.settings.maxViewMB);  return (mb > 0 ? mb : DEFAULTS.maxViewMB)  * 1024 * 1024; }
+  editLimit()  { const mb = Number(this.plugin.settings.maxEditMB);  return (mb > 0 ? mb : DEFAULTS.maxEditMB)  * 1024 * 1024; }
+  imageLimit() { const mb = Number(this.plugin.settings.maxImageMB); return (mb > 0 ? mb : DEFAULTS.maxImageMB) * 1024 * 1024; }
+  quickTextLimit() { return Math.min(this.viewLimit() / 10, 1024 * 1024); }
 
   async actView() {
     const wp = this.workPanel();
@@ -865,16 +991,16 @@ the bar at the bottom is clickable and always works.`);
 
     // images → show the picture (read as a data: URL so it works outside the vault)
     if (IMAGE_RE.test(f.name)) {
-      if (st.size > 16 * 1024 * 1024) { new Notice('Image too large for preview (> 16 MB).'); return; }
+      if (st.size > this.imageLimit()) { new Notice(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return; }
       try {
         const buf = await this.fp.readBinary(f.full);
-        const data = `data:${mimeFor(f.name)};base64,${toBase64(buf)}`;
+        const data = await bytesToDataURL(buf, mimeFor(f.name));
         new ViewerModal(this.app, { title: `View — ${f.name}`, image: data }).open();
-      } catch (_) { new Notice('Could not load image.'); }
+      } catch (e) { new Notice('Could not load image: ' + (e && e.message ? e.message : e)); }
       return;
     }
 
-    if (st.size > 1024 * 1024) { new Notice('File too large for the viewer (> 1 MB).'); return; }
+    if (st.size > this.viewLimit()) { new Notice(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return; }
     let content;
     try { content = await this.fp.read(f.full); }
     catch (_) { new Notice('Binary file or read error.'); return; }
@@ -888,7 +1014,7 @@ the bar at the bottom is clickable and always works.`);
       return;
     }
 
-    new ViewerModal(this.app, { title: `View — ${f.name}`, content }).open();
+    new ViewerModal(this.app, { title: `View — ${f.name}`, content, wrap: this.plugin.settings.wrapText }).open();
   }
 
   async actEdit() {
@@ -902,18 +1028,21 @@ the bar at the bottom is clickable and always works.`);
     try { st = await this.fp.stat(f.full); } catch (_) { new Notice('Cannot open file.'); return; }
     if (st.isDir) { new Notice('That is a directory.'); return; }
 
-    // inside the vault → open the real file in Obsidian in a new tab
+    // md / canvas inside the vault → open in Obsidian's own editor (new tab).
+    // Other types (txt, json, …) have no in-app editor, so openFile() would hand
+    // them to the OS ("open with…" on iOS) — those use the built-in editor below.
     const vaultFile = this.toVaultPath(f.full);
-    if (vaultFile) {
+    if (vaultFile && /\.(md|canvas)$/i.test(f.name)) {
       const af = this.app.vault.getAbstractFileByPath(vaultFile);
       if (af) { this.app.workspace.getLeaf('tab').openFile(af); return; }
     }
 
+    if (st.size > this.editLimit()) { new Notice(`File too large for the internal editor (max ${fmtSize(this.editLimit())}).`); return; }
     let content;
     try { content = await this.fp.read(f.full); }
     catch (_) { new Notice('Binary file or read error.'); return; }
     new ViewerModal(this.app, {
-      title: `Edit — ${f.name}`, content, editable: true,
+      title: `Edit — ${f.name}`, content, editable: true, wrap: this.plugin.settings.wrapText,
       onSave: async (text) => {
         try { await this.fp.write(f.full, text); new Notice('Saved.'); await this.refresh(); }
         catch (e) { new Notice('Error while saving: ' + e.message); }
@@ -960,7 +1089,9 @@ the bar at the bottom is clickable and always works.`);
       if (sel.length !== 1) { new Notice('Select only one object to rename.'); return; }
       const f = sel[0];
       new PromptModal(this.app, {
-        title: 'Rename', value: f.name, onSubmit: async (name) => {
+        title: 'Rename', value: f.name,
+        validate: (name) => invalidNameReason(name),
+        onSubmit: async (name) => {
           if (!name || name === f.name) return;
           try { await this.fp.rename(f.full, this.P.join(wp.cwd, name)); await this.refresh(); }
           catch (e) { new Notice('Error: ' + e.message); }
@@ -1074,7 +1205,9 @@ the bar at the bottom is clickable and always works.`);
     if (!wp) { new Notice('No file panel active.'); return; }
     if (wp.zip) { new Notice('Making a directory inside an archive is not possible.'); return; }
     new PromptModal(this.app, {
-      title: 'Make directory', value: '', placeholder: 'Name', onSubmit: async (name) => {
+      title: 'Make directory', value: '', placeholder: 'Name',
+      validate: (name) => invalidNameReason(name),
+      onSubmit: async (name) => {
         if (!name) return;
         try {
           await this.fp.mkdir(this.P.join(wp.cwd, name));
@@ -1170,6 +1303,7 @@ the bar at the bottom is clickable and always works.`);
     ];
     if (this.fp.capabilities.exec) items.push({ label: 'Command line enabled', checked: s.enableExec, run: () => this.toggleSetting('enableExec') });
     items.push({ label: 'Hidden files', checked: s.showHidden, run: () => this.toggleHidden() });
+    items.push({ label: 'Wrap long lines (viewer / quick view)', checked: s.wrapText, run: () => this.toggleWrap() });
     items.push({ sep: true });
     items.push({ label: 'Theme: Commander Blue', checked: s.theme !== 'gray', run: () => this.setTheme('blue') });
     items.push({ label: 'Theme: Navigator Gray', checked: s.theme === 'gray', run: () => this.setTheme('gray') });
@@ -1421,6 +1555,7 @@ the bar at the bottom is clickable and always works.`);
   clearTags() { const p = this.workPanel(); if (!p) return; p.tagged.clear(); this.renderPanel(p); }
   toggleHidden() { this.plugin.settings.showHidden = !this.plugin.settings.showHidden; this.plugin.saveSettings(); this.refresh(); }
   toggleSetting(key) { this.plugin.settings[key] = !this.plugin.settings[key]; this.plugin.saveSettings(); }
+  toggleWrap() { this.plugin.settings.wrapText = !this.plugin.settings.wrapText; this.plugin.saveSettings(); this.renderAll(); }
   openInSystem() {
     const p = this.workPanel() || this.active;
     try { this.fp.openInSystem(p.cwd); }
@@ -1430,7 +1565,9 @@ the bar at the bottom is clickable and always works.`);
     const wp = this.workPanel();
     if (!wp) { new Notice('No file panel active.'); return; }
     if (wp.zip) { new Notice('Not possible inside an archive.'); return; }
-    new PromptModal(this.app, { title: 'New file', placeholder: 'File name', onSubmit: async (name) => {
+    new PromptModal(this.app, { title: 'New file', placeholder: 'File name',
+      validate: (name) => invalidNameReason(name),
+      onSubmit: async (name) => {
       if (!name) return;
       const full = this.P.join(wp.cwd, name);
       try {
@@ -1459,18 +1596,18 @@ the bar at the bottom is clickable and always works.`);
     try { buf = await this.fp.extractZipEntry(p.zip.path, en.zipEntry); }
     catch (e) { new Notice('Could not read entry: ' + e.message); return; }
     if (IMAGE_RE.test(en.name)) {
-      if (buf.length > 16 * 1024 * 1024) { new Notice('Image too large for preview.'); return; }
-      const data = `data:${mimeFor(en.name)};base64,${toBase64(buf)}`;
+      if (buf.length > this.imageLimit()) { new Notice(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return; }
+      const data = await bytesToDataURL(buf, mimeFor(en.name));
       new ViewerModal(this.app, { title: `View — ${en.name}`, image: data }).open();
       return;
     }
-    if (buf.length > 1024 * 1024) { new Notice('File too large for the viewer (> 1 MB).'); return; }
+    if (buf.length > this.viewLimit()) { new Notice(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return; }
     const content = new TextDecoder().decode(buf);
     if (/\.(md|markdown)$/i.test(en.name)) {
       new ViewerModal(this.app, { title: `Preview — ${en.name}`, markdown: content, sourcePath: '', component: this }).open();
       return;
     }
-    new ViewerModal(this.app, { title: `View — ${en.name}`, content }).open();
+    new ViewerModal(this.app, { title: `View — ${en.name}`, content, wrap: this.plugin.settings.wrapText }).open();
   }
 
   zipDirSize(zip, base) {
@@ -1601,14 +1738,16 @@ the bar at the bottom is clickable and always works.`);
 
   /* ── sorting: Name / Endung / Zeit / Größe / Unsortiert (Strg+F3..F7) ── */
 
-  sortComparator(key) {
+  sortComparator(key, asc) {
     const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    let base;
     switch (key) {
-      case 'ext':  return (a, b) => this.P.extname(a.name).toLowerCase().localeCompare(this.P.extname(b.name).toLowerCase()) || byName(a, b);
-      case 'time': return (a, b) => (b.mtime - a.mtime) || byName(a, b);   // newest first
-      case 'size': return (a, b) => (b.size - a.size) || byName(a, b);     // largest first
-      default:     return byName;                                          // 'name'
+      case 'ext':  base = (a, b) => this.P.extname(a.name).toLowerCase().localeCompare(this.P.extname(b.name).toLowerCase()) || byName(a, b); break;
+      case 'time': base = (a, b) => (a.mtime - b.mtime) || byName(a, b); break;   // ascending: oldest first
+      case 'size': base = (a, b) => (a.size - b.size) || byName(a, b); break;     // ascending: smallest first
+      default:     base = byName;                                                 // 'name'
     }
+    return asc === false ? (a, b) => -base(a, b) : base;
   }
 
   // re-order p.entries in place: '..' first, directories before files, each
@@ -1619,23 +1758,32 @@ the bar at the bottom is clickable and always works.`);
     const dirs = p.entries.filter((e) => !e.up && e.isDir);
     const files = p.entries.filter((e) => !e.up && !e.isDir);
     if (key !== 'unsorted') {
-      const cmp = this.sortComparator(key);
+      const cmp = this.sortComparator(key, p.sortAsc !== false);
       dirs.sort(cmp); files.sort(cmp);
     }
     p.entries = up.concat(dirs, files);
   }
 
-  setSort(p, key) {
-    if (p.sortKey === key) return;
+  // set the sort column; clicking/choosing the same column again flips direction.
+  // `dir` (optional): true = ascending, false = descending; omit = toggle/default.
+  setSort(p, key, dir) {
     const cur = p.entries[p.cursor];          // try to keep the cursor on the same entry
-    p.sortKey = key;
+    if (key === p.sortKey && key !== 'unsorted') {
+      p.sortAsc = dir != null ? dir : !(p.sortAsc !== false);   // same column → flip
+    } else {
+      p.sortKey = key;
+      // new column → classic default: name/ext ascending (a..z), time/size
+      // descending (newest / largest first)
+      p.sortAsc = dir != null ? dir : !(key === 'time' || key === 'size');
+    }
     this.applySort(p);
     const idx = cur ? p.entries.indexOf(cur) : -1;
     if (idx >= 0) p.cursor = idx;
     p.cursor = Math.max(0, Math.min(p.cursor, p.entries.length - 1));
     this.persist();
     this.renderPanel(p);
-    new Notice('Sort: ' + this.sortLabel(key));
+    const arrow = key === 'unsorted' ? '' : (p.sortAsc !== false ? ' ↑' : ' ↓');
+    new Notice('Sort: ' + this.sortLabel(key) + arrow);
   }
 
   sortLabel(key) {
@@ -1646,9 +1794,10 @@ the bar at the bottom is clickable and always works.`);
   updateColHead(p) {
     if (!p.colName) return;
     const k = p.sortKey || 'name';
-    p.colName.setText(k === 'ext' ? 'Extension ▾' : ('Name' + (k === 'name' ? ' ▾' : '')));
-    p.colSize.setText('Size' + (k === 'size' ? ' ▾' : ''));
-    p.colDate.setText('Date' + (k === 'time' ? ' ▾' : ''));
+    const arrow = (p.sortAsc !== false) ? ' ▴' : ' ▾';   // ▴ ascending, ▾ descending
+    p.colName.setText((k === 'ext' ? 'Extension' : 'Name') + ((k === 'name' || k === 'ext') ? arrow : ''));
+    p.colSize.setText('Size' + (k === 'size' ? arrow : ''));
+    p.colDate.setText('Date' + (k === 'time' ? arrow : ''));
   }
 
   /* ── Wide layout (Full = Name/Size/Date · Wide = names in columns) ── */
@@ -1710,6 +1859,7 @@ the bar at the bottom is clickable and always works.`);
     new HotlistModal(this.app, {
       current: cur,
       home: this.fp.homeDir(),
+      absolute: this.fp.capabilities.absolutePaths,
       bookmarks: (this.plugin.settings.hotlist || []).slice(),
       onGo: (target) => this.gotoPath(target),
       onAdd: (target) => this.addBookmark(target),
@@ -1797,9 +1947,17 @@ the bar at the bottom is clickable and always works.`);
     const cur = src.entries[src.cursor];
     if (cur && !cur.up) {
       const b3 = wrap.createDiv({ cls: 'nc-info-box' });
-      const sz = cur.isDir ? '‹DIR›' : `${fmtSize(cur.size)} bytes`;
+      const dateSuffix = cur.mtime ? '   ' + fmtDate(cur.mtime) : '';
       b3.createDiv({ cls: 'nc-info-line', text: `${cur.name}` });
-      b3.createDiv({ cls: 'nc-info-line', text: `${sz}${cur.mtime ? '   ' + fmtDate(cur.mtime) : ''}` });
+      const szLine = b3.createDiv({ cls: 'nc-info-line', text: (cur.isDir ? '‹DIR›' : `${fmtSize(cur.size)} bytes`) + dateSuffix });
+      // for folders, show the recursive content size (compute once, cache on the entry)
+      if (cur.isDir) {
+        if (cur.dirSize != null) szLine.setText(`${fmtSize(cur.dirSize)} bytes${dateSuffix}`);
+        else this.computeDirSize(src, cur).then(() => {
+          if (seq !== p.renderSeq) return;
+          szLine.setText(`${fmtSize(cur.dirSize)} bytes${dateSuffix}`);
+        }).catch(() => {});
+      }
     }
 
     const b4 = wrap.createDiv({ cls: 'nc-info-box' });
@@ -1861,23 +2019,26 @@ the bar at the bottom is clickable and always works.`);
     if (seq !== p.renderSeq) return;
 
     if (IMAGE_RE.test(en.name)) {
-      if (st.size > 16 * 1024 * 1024) { p.listEl.createDiv({ cls: 'nc-quick-msg', text: 'Image too large for preview.' }); return; }
+      if (st.size > this.imageLimit()) { p.listEl.createDiv({ cls: 'nc-quick-msg', text: `Image too large for preview (max ${fmtSize(this.imageLimit())}).` }); return; }
       try {
         const buf = await this.fp.readBinary(full);
         if (seq !== p.renderSeq) return;
+        const src = await bytesToDataURL(buf, mimeFor(en.name));
+        if (seq !== p.renderSeq) return;
         const img = p.listEl.createDiv({ cls: 'nc-quick-img' }).createEl('img');
-        img.src = `data:${mimeFor(en.name)};base64,${toBase64(buf)}`;
+        img.src = src;
       } catch (_) { if (seq === p.renderSeq) p.listEl.createDiv({ cls: 'nc-quick-msg', text: 'Could not load image.' }); }
       return;
     }
 
-    if (st.size > 256 * 1024) { p.listEl.createDiv({ cls: 'nc-quick-msg nc-info-dim', text: `File too large for quick view (${fmtSize(st.size)} bytes).` }); return; }
+    if (st.size > this.quickTextLimit()) { p.listEl.createDiv({ cls: 'nc-quick-msg nc-info-dim', text: `File too large for quick view (${fmtSize(st.size)}, max ${fmtSize(this.quickTextLimit())}).` }); return; }
     let content;
     try { content = await this.fp.read(full); }
     catch (_) { if (seq === p.renderSeq) p.listEl.createDiv({ cls: 'nc-quick-msg nc-info-dim', text: 'Read error.' }); return; }
     if (seq !== p.renderSeq) return;
     if (content.indexOf('\u0000') !== -1) { p.listEl.createDiv({ cls: 'nc-quick-msg nc-info-dim', text: 'Binary file.' }); return; }
-    p.listEl.createEl('pre', { cls: 'nc-quick-pre', text: content });
+    p.listEl.createEl('pre', { cls: 'nc-quick-pre', text: content })
+      .toggleClass('nc-wrap', !!this.plugin.settings.wrapText);
   }
 
   /* ── Tree view: a lazily-loaded directory tree that drives the other panel ── */
@@ -2086,12 +2247,19 @@ class PromptModal extends Modal {
     const input = contentEl.createEl('input', { cls: 'nc-modal-input', attr: { type: 'text', spellcheck: 'false' } });
     input.value = this.opts.value || '';
     if (this.opts.placeholder) input.placeholder = this.opts.placeholder;
+    const errEl = contentEl.createDiv({ cls: 'nc-modal-error' });
     const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
     const ok = row.createEl('button', { text: 'OK', cls: 'nc-btn nc-btn-default' });
     const cancel = row.createEl('button', { text: 'Cancel', cls: 'nc-btn' });
-    const submit = () => { this.submitted = true; const v = input.value.trim(); this.close(); this.opts.onSubmit && this.opts.onSubmit(v); };
+    const submit = () => {
+      const v = input.value.trim();
+      // optional validation keeps the dialog open and shows the reason inline
+      if (this.opts.validate) { const err = this.opts.validate(v); if (err) { errEl.setText(err); return; } }
+      this.submitted = true; this.close(); this.opts.onSubmit && this.opts.onSubmit(v);
+    };
     ok.addEventListener('click', submit);
     cancel.addEventListener('click', () => this.close());
+    input.addEventListener('input', () => errEl.setText(''));
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
     window.setTimeout(() => { input.focus(); input.select(); }, 0);
   }
@@ -2222,12 +2390,17 @@ class ViewerModal extends Modal {
       if (MarkdownRenderer && MarkdownRenderer.render) MarkdownRenderer.render(this.app, this.opts.markdown, div, src, comp);
       else if (MarkdownRenderer && MarkdownRenderer.renderMarkdown) MarkdownRenderer.renderMarkdown(this.opts.markdown, div, src, comp);
       else div.setText(this.opts.markdown);
+      const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
+      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
+      close.addEventListener('click', () => this.close());
       window.setTimeout(() => div.focus(), 0);   // autofocus so PgUp/PgDn/arrows scroll
       return;
     }
 
     if (this.opts.editable) {
       const ta = contentEl.createEl('textarea', { cls: 'nc-viewer-area' });
+      ta.toggleClass('nc-wrap', !!this.opts.wrap);
+      ta.setAttribute('wrap', this.opts.wrap ? 'soft' : 'off');   // native textarea wrapping
       ta.value = this.opts.content;
       const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
       const save = row.createEl('button', { text: 'Save', cls: 'nc-btn nc-btn-default' });
@@ -2235,13 +2408,57 @@ class ViewerModal extends Modal {
       save.addEventListener('click', () => { this.opts.onSave && this.opts.onSave(ta.value); this.close(); });
       close.addEventListener('click', () => this.close());
       window.setTimeout(() => ta.focus(), 0);
+      // Mobile: keep the editor above the on-screen keyboard. The keyboard shrinks
+      // window.visualViewport; we pin the modal to the visible area and let the
+      // textarea flex so the Save/Close buttons stay reachable.
+      if (Platform.isMobile && window.visualViewport) {
+        modalEl.addClass('nc-viewer-edit-mobile');
+        const vv = window.visualViewport;
+        const fit = () => {
+          const innerH = window.innerHeight || vv.height;
+          const innerW = window.innerWidth || innerH;
+          // Obsidian on iOS often does NOT shrink visualViewport for the keyboard,
+          // so the modal would run under it. If the viewport clearly shrank, use it.
+          if (vv.height < innerH - 100) {
+            modalEl.style.top = (vv.offsetTop + 6) + 'px';
+            modalEl.style.height = (vv.height - 12) + 'px';
+            return;
+          }
+          // otherwise cap to ~half the screen so the buttons stay above the keyboard.
+          const h = Math.round(innerH * 0.5);
+          let top = vv.offsetTop + 6;                 // landscape: pin near the top
+          if (innerH > innerW) {                      // portrait: lots of room → center
+            const kbTop = innerH * 0.60;              // keyboard ≈ bottom 40%
+            top = Math.round(vv.offsetTop + Math.max(6, (kbTop - h) / 2));
+          }
+          modalEl.style.top = top + 'px';
+          modalEl.style.height = h + 'px';
+        };
+        this._vvFit = fit;
+        vv.addEventListener('resize', fit);
+        vv.addEventListener('scroll', fit);
+        fit();
+        // when the keyboard animates in on focus, re-fit after it settles
+        ta.addEventListener('focus', () => window.setTimeout(fit, 150));
+      }
     } else {
       const pre = contentEl.createEl('pre', { text: this.opts.content, cls: 'nc-viewer-pre' });
+      pre.toggleClass('nc-wrap', !!this.opts.wrap);
       pre.tabIndex = 0;
+      const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
+      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
+      close.addEventListener('click', () => this.close());
       window.setTimeout(() => pre.focus(), 0);   // autofocus so PgUp/PgDn/arrows scroll
     }
   }
-  onClose() { this.contentEl.empty(); }
+  onClose() {
+    if (this._vvFit && window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', this._vvFit);
+      window.visualViewport.removeEventListener('scroll', this._vvFit);
+      this._vvFit = null;
+    }
+    this.contentEl.empty();
+  }
 }
 
 class DriveModal extends Modal {
@@ -2266,8 +2483,10 @@ class HotlistModal extends Modal {
     modalEl.addClass('nc-modal');
     contentEl.createEl('h3', { text: 'Bookmarks', cls: 'nc-modal-title' });
     this.listWrap = contentEl.createDiv({ cls: 'nc-hotlist' });
-    contentEl.createDiv({ cls: 'nc-hotlist-hint', text: '1–9 = open   ·   Enter = go   ·   Ins = bookmark current   ·   Del = remove   ·   Esc = close' });
+    // keyboard hint only on desktop; mobile uses tap + the per-row ✕ button
+    if (!Platform.isMobile) contentEl.createDiv({ cls: 'nc-hotlist-hint', text: '1–9 = open   ·   Enter = go   ·   Ins = bookmark current   ·   Del = remove   ·   Esc = close' });
     this.build();
+    this.selectInitial();   // preselect the current folder's bookmark, else "Bookmark current"
     this.scope.register([], 'ArrowDown', (e) => { e.preventDefault(); this.move(1); return false; });
     this.scope.register([], 'ArrowUp', (e) => { e.preventDefault(); this.move(-1); return false; });
     this.scope.register([], 'Enter', (e) => { e.preventDefault(); this.activate(); return false; });
@@ -2278,7 +2497,14 @@ class HotlistModal extends Modal {
   }
   gotoNum(d) {
     const it = this.items.find((x) => x.kind === 'bookmark' && x.num === d);
-    if (it && it.path) { this.close(); this.opts.onGo(it.path); }
+    if (it && it.path != null) { this.close(); this.opts.onGo(it.path); }   // '' = vault root is valid
+  }
+  // on open, highlight the bookmark for the current folder if it exists,
+  // otherwise the "Bookmark current folder" action (index 0)
+  selectInitial() {
+    const i = this.items.findIndex((it) => it.kind === 'bookmark' && it.path === this.opts.current);
+    this.sel = i >= 0 ? i : 0;
+    this.markSel();
   }
   build() {
     this.items = [{ kind: 'action', label: '★ Bookmark current folder' }];
@@ -2293,8 +2519,10 @@ class HotlistModal extends Modal {
     this.render();
   }
   selectable(i) { const it = this.items[i]; return !!it && (it.kind === 'action' || it.kind === 'bookmark'); }
-  // show the home folder as "~" instead of the full path
-  tildify(p) {
+  // display a path: vault (relative) paths are shown rooted ("/", "/A/B");
+  // absolute (node) paths keep their full form, with the home folder as "~".
+  disp(p) {
+    if (!this.opts.absolute) return p ? '/' + String(p).replace(/^\/+|\/+$/g, '') : '/';
     const h = this.opts.home;
     if (!h) return p;
     if (p === h) return '~';
@@ -2309,11 +2537,15 @@ class HotlistModal extends Modal {
       const row = this.listWrap.createDiv({ cls: 'nc-hotlist-item' + (i === this.sel ? ' nc-sel' : '') });
       row.dataset.i = String(i);
       if (it.kind === 'bookmark') {
-        // number the bookmarks; 1–9 double as a quick-open shortcut
-        row.createSpan({ cls: 'nc-hotlist-num', text: it.num <= 9 ? String(it.num) : '' });
-        row.createSpan({ cls: 'nc-hotlist-label', text: '★ ' + this.tildify(it.path) });
+        // number the bookmarks (1–9 double as a quick-open shortcut) — hidden on
+        // mobile, where there is no number row
+        if (!Platform.isMobile) row.createSpan({ cls: 'nc-hotlist-num', text: it.num <= 9 ? String(it.num) : '' });
+        row.createSpan({ cls: 'nc-hotlist-label', text: '★ ' + this.disp(it.path) });
+        // per-row delete button (TurboVision-style); the main way to remove on mobile
+        const del = row.createSpan({ cls: 'nc-hotlist-del', text: '✕', attr: { 'aria-label': 'Remove bookmark', title: 'Remove bookmark' } });
+        del.addEventListener('click', (e) => { e.stopPropagation(); this.removeAt(i); });
       } else {
-        row.setText(it.path ? this.tildify(it.path) : it.label);
+        row.createSpan({ cls: 'nc-hotlist-label', text: it.path ? this.disp(it.path) : it.label });
       }
       row.addEventListener('click', () => { this.sel = i; this.activate(); });
       row.addEventListener('mouseenter', () => { this.sel = i; this.markSel(); });
@@ -2334,7 +2566,7 @@ class HotlistModal extends Modal {
     const it = this.items[this.sel];
     if (!it) return;
     if (it.kind === 'action') { this.addCurrent(); return; }
-    if (it.path) { this.close(); this.opts.onGo(it.path); }
+    if (it.path != null) { this.close(); this.opts.onGo(it.path); }   // '' = vault root is valid
   }
   addCurrent() {
     if (!this.opts.bookmarks.includes(this.opts.current)) {
@@ -2343,14 +2575,15 @@ class HotlistModal extends Modal {
     }
     this.build();
   }
-  removeSel() {
-    const it = this.items[this.sel];
-    if (it && it.kind === 'bookmark') {
-      this.opts.onRemove(it.path);
-      const bi = this.opts.bookmarks.indexOf(it.path);
-      if (bi >= 0) this.opts.bookmarks.splice(bi, 1);
-      this.build();
-    }
+  removeSel() { this.removeAt(this.sel); }
+  removeAt(i) {
+    const it = this.items[i];
+    if (!it || it.kind !== 'bookmark') return;
+    this.opts.onRemove(it.path);
+    const bi = this.opts.bookmarks.indexOf(it.path);
+    if (bi >= 0) this.opts.bookmarks.splice(bi, 1);
+    if (this.sel >= i && this.sel > 0) this.sel--;   // keep a sensible selection after removal
+    this.build();
   }
   onClose() { this.contentEl.empty(); }
 }
@@ -2378,6 +2611,36 @@ class NCSettingTab extends PluginSettingTab {
       .addToggle((t) => t.setValue(this.plugin.settings.confirmCopy)
         .onChange(async (v) => { this.plugin.settings.confirmCopy = v; await this.plugin.saveSettings(); }));
 
+    new Setting(containerEl).setName('Max file size for viewer (MB)')
+      .setDesc('Largest text/code file the F3 viewer will open. Quick view uses 1/10 of this (capped at 1 MB).')
+      .addText((t) => t.setPlaceholder(String(DEFAULTS.maxViewMB))
+        .setValue(String(this.plugin.settings.maxViewMB))
+        .onChange(async (v) => {
+          const n = Number(v);
+          this.plugin.settings.maxViewMB = (Number.isFinite(n) && n > 0) ? n : DEFAULTS.maxViewMB;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl).setName('Max file size for internal editor (MB)')
+      .setDesc('Largest file the built-in F4 editor will open. Editing is heavier than viewing, especially with line wrap.')
+      .addText((t) => t.setPlaceholder(String(DEFAULTS.maxEditMB))
+        .setValue(String(this.plugin.settings.maxEditMB))
+        .onChange(async (v) => {
+          const n = Number(v);
+          this.plugin.settings.maxEditMB = (Number.isFinite(n) && n > 0) ? n : DEFAULTS.maxEditMB;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl).setName('Max image preview size (MB)')
+      .setDesc('Largest image the viewer and quick view will display.')
+      .addText((t) => t.setPlaceholder(String(DEFAULTS.maxImageMB))
+        .setValue(String(this.plugin.settings.maxImageMB))
+        .onChange(async (v) => {
+          const n = Number(v);
+          this.plugin.settings.maxImageMB = (Number.isFinite(n) && n > 0) ? n : DEFAULTS.maxImageMB;
+          await this.plugin.saveSettings();
+        }));
+
     if (VC_PROVIDER !== 'vault') {
       new Setting(containerEl).setName('Command line enabled')
         .setDesc('Allows running real shell commands from the command line.')
@@ -2399,18 +2662,25 @@ class NCSettingTab extends PluginSettingTab {
     hkSetting.addButton((btn) => {
       btn.setButtonText(hotkeyLabel(this.plugin.settings.fullscreenHotkey) || 'Not set');
       btn.onClick(() => {
-        btn.setButtonText('Press key(s)…');
+        btn.setButtonText('Press key(s)…  (Esc = cancel)');
         this.plugin.recordingHotkey = true;
+        const stop = () => {
+          document.removeEventListener('keydown', onKey, true);
+          this.plugin.recordingHotkey = false;
+          this._recordStop = null;
+        };
         const onKey = (e) => {
           if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(e.key)) return;
           e.preventDefault(); e.stopPropagation();
+          if (e.key === 'Escape') { stop(); btn.setButtonText(hotkeyLabel(this.plugin.settings.fullscreenHotkey) || 'Not set'); return; }
           const hk = { meta: e.metaKey, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, key: e.key };
           this.plugin.settings.fullscreenHotkey = hk;
           this.plugin.saveSettings();
-          document.removeEventListener('keydown', onKey, true);
-          this.plugin.recordingHotkey = false;
+          stop();
           btn.setButtonText(hotkeyLabel(hk));
         };
+        // remember the canceller so hide() can clean up if the user leaves mid-record
+        this._recordStop = stop;
         document.addEventListener('keydown', onKey, true);
       });
     });
@@ -2420,6 +2690,10 @@ class NCSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
         this.display();
       }));
+  }
+  hide() {
+    // tear down a pending hotkey recorder if the user closed settings mid-record
+    if (this._recordStop) this._recordStop();
   }
 }
 
@@ -2462,7 +2736,8 @@ class VaultCommanderPlugin extends Plugin {
   }
 
   onunload() {
-    this.app.workspace.getLeavesOfType(VIEW_TYPE_NC).forEach((l) => l.detach());
+    // Obsidian cleans up registered views/leaves itself; detaching here is
+    // discouraged (it interferes with workspace restore on reload).
   }
 
   async activateView() {

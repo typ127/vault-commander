@@ -52,11 +52,14 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
   outline: none;
   user-select: none;
 }
-/* black spacer so Obsidian's status bar (word/char count) stays clear,
-   instead of showing the blue panel background */
-.nc-bottompad {
-  flex: 0 0 48px;
-  background: #000;
+
+/* ── mobile: zoom the whole commander up so rows are comfortably tappable
+   (~15 visible rows instead of ~25). Everything inside is sized in em/ch
+   relative to .nc-root, so scaling the root font + line-height enlarges the
+   entire UI uniformly without changing the layout. Desktop is untouched. ── */
+body.is-mobile .nc-root {
+  font-size: 17px;
+  line-height: 23px;
 }
 
 /* ── panels ── */
@@ -87,7 +90,9 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
   overflow: hidden;
   text-overflow: ellipsis;
   direction: rtl;            /* truncate the long left part of the path */
+  cursor: pointer;           /* clicking the header opens the bookmarks dialog */
 }
+.nc-panel-head:hover { color: var(--nc-white); }
 .nc-panel.nc-active .nc-panel-head {
   background: var(--nc-cyan);
   color: var(--nc-black);
@@ -104,6 +109,9 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
 .nc-colhead .nc-c-name { flex: 1 1 auto; }
 .nc-colhead .nc-c-size { width: 13ch; text-align: right; }
 .nc-colhead .nc-c-date { width: 15ch; text-align: right; padding-left: 1ch; }
+/* column headers are clickable to change the sort column / direction */
+.nc-colhead span { cursor: pointer; }
+.nc-colhead span:hover { color: var(--nc-white); }
 
 .nc-list {
   flex: 1 1 auto;
@@ -144,6 +152,12 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
 }
 .nc-panel:not(.nc-active) .nc-row.nc-cursor {
   background: rgba(84, 254, 254, 0.18);
+}
+/* cursor sitting on a tagged (yellow) row: keep the text yellow in both themes,
+   instead of the cursor bar's default dark text */
+.nc-panel.nc-active .nc-row.nc-cursor.nc-tagged,
+.nc-panel.nc-active .nc-row.nc-cursor.nc-tagged .nc-name {
+  color: var(--nc-yellow);
 }
 
 .nc-panel-foot {
@@ -243,7 +257,9 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
   /* hard, semi-transparent DOS drop-shadow: bottom-right, right ≈ 2× bottom */
   box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55) !important;   /* big hard DOS shadow, bottom-right */
 }
-.modal.nc-modal .modal-close-button { color: #000; }
+/* hide Obsidian's round close button — doesn't fit the DOS theme; our modals
+   provide their own Close / action buttons (or tap-outside / Esc still works) */
+.modal.nc-modal .modal-close-button { display: none; }
 .nc-modal-danger { border-color: #fcfcfc; }
 
 .nc-modal-title {
@@ -275,6 +291,11 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
   font-size: 1em;
   padding: 2px 6px;
   margin-bottom: 1em;
+}
+/* inline validation message in prompt dialogs (empty unless there's an error) */
+.nc-modal-error:not(:empty) {
+  color: #ff5555;
+  margin: -0.6em 0 0.8em;
 }
 
 .nc-modal-buttons {
@@ -326,6 +347,37 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
 }
 .nc-viewer-pre:focus,
 .nc-viewer-md:focus { box-shadow: inset 0 0 0 1px #aaffff; }
+
+/* mobile text editor: sized to the visual viewport (set via JS) so it sits above
+   the on-screen keyboard; the textarea fills the space, buttons stay pinned */
+.modal.nc-viewer-edit-mobile {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  max-height: none;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.modal.nc-viewer-edit-mobile .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.modal.nc-viewer-edit-mobile .nc-viewer-area {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 3em;
+}
+.modal.nc-viewer-edit-mobile .nc-modal-buttons { flex: 0 0 auto; margin-top: 6px; }
+
+/* Options → "Wrap long lines": wrap instead of horizontal-scrolling long lines,
+   in the viewer (pre + edit textarea) and quick view. */
+.nc-viewer-pre.nc-wrap,
+.nc-viewer-area.nc-wrap,
+.nc-quick-pre.nc-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* image preview */
 .nc-viewer-img {
@@ -562,16 +614,29 @@ body.nc-fs-active .notice-container { z-index: 1100 !important; }
 .nc-hotlist-head { color: #006e6e; border-bottom: 1px solid #888; margin: 6px 0 2px; padding: 0 4px; }
 .nc-hotlist-note { color: #555; padding: 0 8px; }
 .nc-hotlist-item {
+  display: flex;
+  align-items: center;
   padding: 1px 8px;
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   color: #000;
 }
+.nc-hotlist-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nc-hotlist-item.nc-sel { background: #00a8a8; color: #000; }
-.nc-hotlist-num { display: inline-block; width: 1.4em; text-align: right; margin-right: .5em; color: #006e6e; font-weight: bold; }
+.nc-hotlist-num { flex: 0 0 auto; width: 1.4em; text-align: right; margin-right: .5em; color: #006e6e; font-weight: bold; }
 .nc-hotlist-item.nc-sel .nc-hotlist-num { color: #000; }
+/* TurboVision-style per-row delete button (DOS red with hard drop-shadow) */
+.nc-hotlist-del {
+  flex: 0 0 auto;
+  margin-left: .6em;
+  padding: 0 .7ch;
+  background: #a80000;
+  color: #fff;
+  line-height: 1.2;
+  box-shadow: 2px 1px 0 0 rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+.nc-hotlist-del:hover,
+.nc-hotlist-del:active { background: #fc5454; color: #000; }
 .nc-hotlist-hint { color: #333; font-size: .82em; text-align: center; }
 
 /* ============================================================
