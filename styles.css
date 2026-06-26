@@ -28,16 +28,16 @@
 }
 
 /* fullscreen: the NC leaf covers the workspace, sidebars and ribbon … */
-.workspace-leaf.nc-fs {
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 100 !important;
+body.nc-fs-active .workspace-leaf.nc-fs {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
 }
 /* … but dialogs, menus and notices must still appear ON TOP of it */
-body.nc-fs-active .modal-container { z-index: 1000 !important; }
+body.nc-fs-active .modal-container { z-index: 1000; }
 body.nc-fs-active .menu,
 body.nc-fs-active .suggestion-container,
-body.nc-fs-active .notice-container { z-index: 1100 !important; }
+body.nc-fs-active .notice-container { z-index: 1100; }
 
 .nc-root {
   position: relative;
@@ -189,7 +189,9 @@ body.is-mobile .nc-root {
   color: var(--nc-white);
 }
 .nc-cmd-sep { flex: 0 0 auto; white-space: pre; color: var(--nc-white); }
-.nc-cmd-input {
+/* scoped under .nc-root so it overrides Obsidian's input box-shadow by
+   specificity rather than a forced override */
+.nc-root .nc-cmd-input {
   flex: 1 1 auto;
   min-width: 0;                /* let the input shrink instead of overflowing */
   background: transparent;
@@ -199,7 +201,7 @@ body.is-mobile .nc-root {
   font-family: var(--nc-font);
   font-size: 15px;
   padding: 0;
-  box-shadow: none !important;
+  box-shadow: none;
 }
 
 /* ── function-key bar ── */
@@ -242,11 +244,11 @@ body.is-mobile .nc-root {
    ============================================================ */
 /* non-modal: drop Obsidian's dark dimmed backdrop behind our dialogs */
 .modal-container:has(.modal.nc-modal) {
-  background-color: transparent !important;
+  background-color: transparent;
 }
 .modal-container:has(.modal.nc-modal) .modal-bg {
-  background-color: transparent !important;
-  opacity: 0 !important;
+  background-color: transparent;
+  opacity: 0;
 }
 .modal.nc-modal {
   background: #aaaaaa;
@@ -255,7 +257,7 @@ body.is-mobile .nc-root {
   color: #000;
   font-family: "Px437 IBM VGA8", "Consolas", "Menlo", "Courier New", monospace;
   /* hard, semi-transparent DOS drop-shadow: bottom-right, right ≈ 2× bottom */
-  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55) !important;   /* big hard DOS shadow, bottom-right */
+  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55);   /* big hard DOS shadow, bottom-right */
 }
 /* hide Obsidian's round close button — doesn't fit the DOS theme; our modals
    provide their own Close / action buttons (or tap-outside / Esc still works) */
