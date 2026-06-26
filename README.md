@@ -2,6 +2,8 @@
 
 A blue, dual-panel **orthodox file manager** for [Obsidian](https://obsidian.md) — inspired by the classic DOS file commanders of the late 80s/90s. Two panels side by side, full keyboard control, and the iconic blue screen with double-line borders.
 
+![Vault Commander](screen_with_menu.png)
+
 Vault Commander gives you a fast, keyboard-driven way to **browse, copy, move, rename and preview the notes and attachments inside your vault** — all through Obsidian's own vault API.
 
 > **Scope:** Vault Commander works entirely **within your vault**. It uses only Obsidian's vault API — it does not touch files outside the vault, run shell commands, or use Node filesystem access. Runs on **desktop and mobile**.

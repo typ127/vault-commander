@@ -6,7 +6,7 @@
  * Hand-written CommonJS (no build step). Desktop only.
  * ============================================================ */
 
-const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope } = require('obsidian');
+const { Plugin, ItemView, Modal, Notice, PluginSettingTab, Setting, MarkdownRenderer, Scope, Platform } = require('obsidian');
 const path = require('path');   // pure string utility (no filesystem access) — used by both backends
 
 const VC_NAME = "Vault Commander";                  /* @variant:name */
@@ -399,11 +399,17 @@ class NCView extends ItemView {
     p.listEl.addEventListener('click', (e) => {
       const row = e.target.closest('.nc-row');
       if (!row) return;
+      const i = parseInt(row.dataset.i, 10);
+      // Mobile has no reliable dblclick: a tap moves the cursor; tapping the row
+      // that is already selected (in the already-active panel) opens it.
+      const reTap = Platform.isMobile && this.active === p && p.cursor === i;
       this.active = p;
-      p.cursor = parseInt(row.dataset.i, 10);
+      if (reTap) { this.openEntry(); return; }
+      p.cursor = i;
       this.refreshMarks(this.left); this.refreshMarks(this.right); this.renderCmd();
     });
     p.listEl.addEventListener('dblclick', (e) => {
+      if (Platform.isMobile) return;   // mobile opens via the re-tap logic above
       const row = e.target.closest('.nc-row');
       if (!row) return;
       this.active = p;
@@ -1954,8 +1960,18 @@ the bar at the bottom is clickable and always works.`);
       const conn = it.isRoot ? '' : it.prefix + (it.isLast ? '└── ' : '├── ');
       row.createSpan({ cls: 'nc-tree-conn', text: conn });
       row.createSpan({ cls: 'nc-tree-name', text: it.node.name });
-      row.addEventListener('mousedown', (e) => { e.stopPropagation(); this.setActive(p); p.tree.cursor = i; this.treeSelect(p); });
-      row.addEventListener('dblclick', (e) => { e.stopPropagation(); p.tree.cursor = i; this.treeToggle(p); });
+      row.addEventListener('mousedown', (e) => {
+        e.stopPropagation();
+        // Mobile: tapping the already-selected node toggles it (no dblclick).
+        const reTap = Platform.isMobile && this.active === p && p.tree.cursor === i;
+        this.setActive(p); p.tree.cursor = i;
+        if (reTap) { this.treeToggle(p); return; }
+        this.treeSelect(p);
+      });
+      row.addEventListener('dblclick', (e) => {
+        if (Platform.isMobile) return;   // mobile toggles via the re-tap logic above
+        e.stopPropagation(); p.tree.cursor = i; this.treeToggle(p);
+      });
     });
     this.refreshTreeMarks(p);
   }
