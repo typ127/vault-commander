@@ -53,13 +53,16 @@ const DEFAULTS = {
   confirmDelete: true,
   confirmCopy: true,
   enableExec: true,
-  showHidden: true,
+  showHidden: false,
   maxViewMB: 5,     // viewer (F3) text/code size cap in MB; quick-view text = 1/10 of this (capped at 1 MB)
   maxEditMB: 2,     // internal editor (F4) size cap in MB (editing is heavier than read-only viewing)
   maxImageMB: 32,   // image preview size cap in MB (viewer + quick view)
   openFullscreen: true,   // vault build / mobile: open the commander in fullscreen from the ribbon
   wrapText: false,  // wrap long lines in the text viewer / quick view (off = horizontal scroll)
   fullscreenHotkey: { meta: true, ctrl: false, alt: false, shift: false, key: 'F12' },
+  screensaverEnabled: false,
+  screensaverName: 'starnight',  // starnight | lines | polygons | fireworks | worms | tiles
+  screensaverDelay: 1,         // idle minutes before screensaver starts
 };
 
 /* ── helpers ─────────────────────────────────────────────── */
@@ -208,7 +211,7 @@ class VaultProvider {
     this.adapter = app.vault.adapter;
     this.paths = new VaultPaths();
   }
-  get capabilities() { return { exec: false, drives: false, archives: false, freeSpace: false, absolutePaths: false }; }
+  get capabilities() { return { exec: false, drives: false, archives: false, freeSpace: false, absolutePaths: false, clipboard: false }; }
 
   // adapter expects '/' for the vault root and slash-free relative paths elsewhere
   // use Obsidian's normalizePath (collapses //, strips leading/trailing /, fixes \).
@@ -300,10 +303,11 @@ class VaultProvider {
     catch (_) { await this.copy(src, dst); await this.remove(src); }
   }
 
-  async dirSize(dir) {
+  async dirSize(dir, shouldCancel) {
     let total = 0;
     const stack = [this.norm(dir)];
     while (stack.length) {
+      if (shouldCancel && shouldCancel()) return total;
       const d = stack.pop();
       let res;
       try { res = await this.adapter.list(d); } catch (_) { continue; }
@@ -346,12 +350,12 @@ class NCView extends ItemView {
     this.right = this.makePanelState('right', plugin.settings.rightPath);
     this.active = this.left;
     this.fullscreen = false;
+    this.fileClip = null;   // { mode: 'copy'|'move', files: [{name, full}] } — Cmd+C/X
   }
 
   getViewType() { return VIEW_TYPE_NC; }
   getDisplayText() { return VC_NAME; }
   getIcon() { return 'panel-left-dashed'; }
-
   makePanelState(side, cwd) {
     const dir = cwd || this.fp.homeDir();
     const mode = this.plugin.settings[side + 'Mode'] || 'list';
@@ -385,11 +389,19 @@ class NCView extends ItemView {
     // otherwise eats space); respects the setting and is still toggleable (menu / F10)
     if (Platform.isMobile && this.plugin.settings.openFullscreen) window.setTimeout(() => this.setFullscreen(true), 0);
     window.setTimeout(() => this.focusView(), 0);
+    this.initScreensaverSystem();
   }
 
   async onClose() {
+    if (this._clockTimer) { window.clearInterval(this._clockTimer); this._clockTimer = null; }
+    this.teardownTetris();   // stop a game left running when the leaf is closed
+    this.menu = null;
     this.popMenuScope();
-    window.clearTimeout(this._qsTimer);   // don't let the quick-filter timer fire into detached DOM
+    window.clearTimeout(this._qsTimer);
+    if (this._infoSizeTimer) { window.clearTimeout(this._infoSizeTimer); this._infoSizeTimer = null; }
+    this._ssCancelTimer();
+    if (this._ssAnimFrame) { cancelAnimationFrame(this._ssAnimFrame); this._ssAnimFrame = null; }
+    if (this._ssCanvas) { this._ssCanvas.remove(); this._ssCanvas = null; }
     document.body.classList.remove('nc-fs-active');
     const leafEl = this.containerEl.closest('.workspace-leaf');
     if (leafEl) leafEl.classList.remove('nc-fs');
@@ -408,6 +420,9 @@ class NCView extends ItemView {
     this.rootEl = root;
 
     this.topbarEl = root.createDiv({ cls: 'nc-topbar' });   // persistent menu bar (when enabled)
+
+    if (this._clockTimer) window.clearInterval(this._clockTimer);
+    this._clockTimer = window.setInterval(() => this.updateClock(), 1000);
 
     const panels = root.createDiv({ cls: 'nc-panels' });
     this.left.el = this.buildPanel(panels, this.left);
@@ -460,8 +475,6 @@ class NCView extends ItemView {
   buildPanel(parent, p) {
     const el = parent.createDiv({ cls: 'nc-panel' });
     p.headEl = el.createDiv({ cls: 'nc-panel-head' });
-    // clicking the path header opens the bookmarks dialog for this panel
-    p.headEl.addEventListener('click', (e) => { e.stopPropagation(); this.setActive(p); this.openHotlist(); });
     const colhead = el.createDiv({ cls: 'nc-colhead' });
     p.colName = colhead.createSpan({ cls: 'nc-c-name', text: 'Name' });
     p.colSize = colhead.createSpan({ cls: 'nc-c-size', text: 'Size' });
@@ -571,7 +584,6 @@ class NCView extends ItemView {
   }
 
   /* ── rendering ── */
-
   renderAll() { this.renderPanel(this.left); this.renderPanel(this.right); this.renderCmd(); }
 
   // dispatch to the right renderer based on the panel's view mode
@@ -588,7 +600,63 @@ class NCView extends ItemView {
 
   // full rebuild of a panel's rows — used on load / refresh / dir change
   renderListPanel(p) {
-    p.headEl.setText(p.zip ? `${p.zip.path} ▸ /${p.zip.prefix.replace(/\/$/, '')}` : this.dispPath(p.cwd));
+    p.headEl.empty();
+    const pathEl = p.headEl.createDiv({ cls: 'nc-panel-path' });
+    const starEl = p.headEl.createDiv({ cls: 'nc-panel-star' });
+    starEl.innerHTML = '★'; // yellow star
+    starEl.addEventListener('click', (e) => { e.stopPropagation(); this.setActive(p); this.openHotlist(); });
+
+    if (p.zip) {
+      pathEl.setText(`${p.zip.path} ▸ /${p.zip.prefix.replace(/\/$/, '')}`);
+    } else {
+      const innerPath = pathEl.createSpan();
+      innerPath.style.direction = 'ltr';
+      innerPath.style.unicodeBidi = 'plaintext';
+
+      const navToPart = async (targetPath) => {
+        if (p.cwd === targetPath) return;
+        if (await this.loadPanel(p, targetPath)) {
+          p.cursor = 0; this.renderPanel(p); this.renderCmd();
+        }
+      };
+
+      let segments = [];
+      let current = p.cwd;
+      // On the vault build the root cwd is '' (falsy); emit a single '/' root
+      // segment so the header is never blank (regression from dispPath()).
+      if (!current) segments.unshift({ name: '/', path: current });
+      while (current) {
+        if (this.P.isRoot(current) || current === '/') {
+          segments.unshift({ name: this.fp.capabilities.absolutePaths ? (this.P.root(p.cwd) || '/') : '/', path: current });
+          break;
+        }
+        let b = this.P.basename(current);
+        if (!b) break;
+        segments.unshift({ name: b, path: current });
+        let parent = this.P.dirname(current);
+        if (parent === current) break;
+        current = parent;
+      }
+
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (i > 0) {
+          const sepText = this.P.sep || '/';
+          let s = sepText;
+          if (segments[i-1].name.endsWith(sepText)) {
+            s = '';
+          }
+          if (s) {
+            innerPath.createSpan({ text: s });
+          }
+        }
+        const sEl = innerPath.createSpan({ text: seg.name });
+        sEl.style.cursor = 'pointer';
+        sEl.addEventListener('mouseenter', () => { sEl.style.textDecoration = 'underline'; });
+        sEl.addEventListener('mouseleave', () => { sEl.style.textDecoration = 'none'; });
+        sEl.addEventListener('click', (e) => { e.stopPropagation(); this.setActive(p); navToPart(seg.path); });
+      }
+    }
     this.updateColHead(p);
     const wide = p.layout === 'wide';
     p.listEl.empty();
@@ -697,7 +765,7 @@ class NCView extends ItemView {
         this.applySort(p);
         p.cursor = 0; this.renderPanel(p); this.renderCmd();
       } else {
-        this.viewZipEntry(p, en);
+        this.actView();
       }
       return;
     }
@@ -839,6 +907,7 @@ class NCView extends ItemView {
 
   onKey(e) {
     if (e.target === this.cmdInput) return;
+    if (this._ssWake()) { e.preventDefault(); return; }   // a key dismisses the screensaver
     if (this.menu) { this.menuKey(e); return; }
     // function keys, Tab and drive switches work the same in every panel mode
     if (this.handleGlobalKey(e)) { e.preventDefault(); e.stopPropagation(); return; }
@@ -860,6 +929,24 @@ class NCView extends ItemView {
       return true;
     }
     if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) { this.openHotlist(); return true; }
+    if (e.ctrlKey && (e.key === 'r' || e.key === 'R')) { this.actRenameInPlace(); return true; }
+    // Cmd/Ctrl+C·X·V — file clipboard (copy / cut / paste). On the standalone the
+    // native Edit menu owns these (focus-aware), so we bind them here only for the
+    // Obsidian builds, where there is no such menu. Text fields are unaffected:
+    // onKey() ignores the command line, and the editor/dialogs are separate modals.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && /^[cxv]$/i.test(e.key)) {
+      const nativeEdit = typeof window !== 'undefined' && window.__vc && window.__vc.nativeEditMenu;
+      // Never hijack a live text selection (e.g. Ctrl+C on text in Quick View /
+      // Info / Tree) — let the browser's native copy handle it.
+      const hasTextSel = typeof window !== 'undefined' && window.getSelection && String(window.getSelection()).length > 0;
+      if (!nativeEdit && !hasTextSel) {
+        const k = e.key.toLowerCase();
+        if (k === 'c') this.actFileCopy();
+        else if (k === 'x') this.actFileCut();
+        else this.actPaste();
+        return true;
+      }
+    }
     if (e.altKey && e.key === 'F1') { if (this.fp.capabilities.drives) this.actDrive(this.left); return true; }
     if (e.altKey && e.key === 'F2') { if (this.fp.capabilities.drives) this.actDrive(this.right); return true; }
     switch (e.key) {
@@ -998,45 +1085,97 @@ the bar at the bottom is clickable and always works.`);
   async actView() {
     const wp = this.workPanel();
     if (!wp) { new Notice('No file panel active.'); return; }
+
+    // work out which entry to open first (the cursor's file)
+    let startIdx;
     if (wp.zip) {
       const cur = wp.entries[wp.cursor];
       if (!cur || cur.up || cur.isDir) { new Notice('No file to view.'); return; }
-      this.viewZipEntry(wp, cur);
-      return;
+      startIdx = wp.cursor;
+    } else {
+      const sel = this.getSelection(wp);
+      if (!sel.length) return;
+      const name = sel[0].name;
+      startIdx = wp.entries.findIndex((e) => !e.up && e.name === name);
+      if (startIdx < 0) startIdx = wp.cursor;
     }
-    const sel = this.getSelection(wp);
-    if (!sel.length) return;
-    const f = sel[0];
+
+    // build the first page; a failure here is explicit (Notice shown)
+    const opts = await this.buildViewerOpts(wp, wp.entries[startIdx], false);
+    if (!opts) return;
+
+    // Prev/Next paging: step through the panel's entries, skipping folders and
+    // any file that can't be shown (too large / binary / read error). The
+    // viewer keeps the last-pressed nav button focused so Space pages on.
+    // Paging tracks its position locally (curIdx) and deliberately leaves the
+    // panel cursor where the user left it, so closing the viewer doesn't jump it.
+    let curIdx = startIdx;
+    opts.nav = async (dir) => {
+      let i = curIdx + dir;
+      while (i >= 0 && i < wp.entries.length) {
+        const en = wp.entries[i];
+        if (en && !en.up && !en.isDir) {
+          const o = await this.buildViewerOpts(wp, en, true);
+          if (o) {
+            curIdx = i;
+            return o;
+          }
+        }
+        i += dir;
+      }
+      return null;   // nothing viewable further in that direction
+    };
+
+    new ViewerModal(this.app, opts).open();
+  }
+
+  // Build the ViewerModal content options for a single panel entry, or null if
+  // it can't be shown (directory, too large, binary / read error). With
+  // `silent` (Prev/Next paging) failures are swallowed so the file is simply
+  // skipped; otherwise a Notice explains why (an explicit F3 on one file).
+  async buildViewerOpts(wp, en, silent) {
+    if (!en || en.up || en.isDir) return null;
+    const note = (m) => { if (!silent) new Notice(m); };
+    const isMd = /\.(md|markdown)$/i.test(en.name);
+
+    // inside an archive: read the entry's bytes straight from the zip
+    if (wp.zip) {
+      let buf;
+      try { buf = await this.fp.extractZipEntry(wp.zip.path, en.zipEntry); }
+      catch (e) { note('Could not read entry: ' + (e && e.message ? e.message : e)); return null; }
+      if (IMAGE_RE.test(en.name)) {
+        if (buf.length > this.imageLimit()) { note(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return null; }
+        return { title: `View — ${en.name}`, image: await bytesToDataURL(buf, mimeFor(en.name)) };
+      }
+      if (buf.length > this.viewLimit()) { note(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return null; }
+      const content = new TextDecoder().decode(buf);
+      if (isMd) return { title: `Preview — ${en.name}`, markdown: content, sourcePath: '' };
+      return { title: `View — ${en.name}`, content, wrap: this.plugin.settings.wrapText };
+    }
+
+    // a real file in a panel directory
+    const full = this.P.join(wp.cwd, en.name);
     let st;
-    try { st = await this.fp.stat(f.full); } catch (_) { new Notice('Cannot read file.'); return; }
-    if (st.isDir) { new Notice('That is a directory.'); return; }
+    try { st = await this.fp.stat(full); } catch (_) { note('Cannot read file.'); return null; }
+    if (st.isDir) { note('That is a directory.'); return null; }
 
     // images → show the picture (read as a data: URL so it works outside the vault)
-    if (IMAGE_RE.test(f.name)) {
-      if (st.size > this.imageLimit()) { new Notice(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return; }
+    if (IMAGE_RE.test(en.name)) {
+      if (st.size > this.imageLimit()) { note(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return null; }
       try {
-        const buf = await this.fp.readBinary(f.full);
-        const data = await bytesToDataURL(buf, mimeFor(f.name));
-        new ViewerModal(this.app, { title: `View — ${f.name}`, image: data }).open();
-      } catch (e) { new Notice('Could not load image: ' + (e && e.message ? e.message : e)); }
-      return;
+        const buf = await this.fp.readBinary(full);
+        return { title: `View — ${en.name}`, image: await bytesToDataURL(buf, mimeFor(en.name)) };
+      } catch (e) { note('Could not load image: ' + (e && e.message ? e.message : e)); return null; }
     }
 
-    if (st.size > this.viewLimit()) { new Notice(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return; }
+    if (st.size > this.viewLimit()) { note(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return null; }
     let content;
-    try { content = await this.fp.read(f.full); }
-    catch (_) { new Notice('Binary file or read error.'); return; }
+    try { content = await this.fp.read(full); }
+    catch (_) { note('Binary file or read error.'); return null; }
 
     // markdown → rendered preview (F4 still opens the raw text)
-    if (/\.(md|markdown)$/i.test(f.name)) {
-      new ViewerModal(this.app, {
-        title: `Preview — ${f.name}`, markdown: content,
-        sourcePath: this.toVaultPath(f.full) || '', component: this,
-      }).open();
-      return;
-    }
-
-    new ViewerModal(this.app, { title: `View — ${f.name}`, content, wrap: this.plugin.settings.wrapText }).open();
+    if (isMd) return { title: `Preview — ${en.name}`, markdown: content, sourcePath: this.toVaultPath(full) || '' };
+    return { title: `View — ${en.name}`, content, wrap: this.plugin.settings.wrapText };
   }
 
   async actEdit() {
@@ -1090,12 +1229,168 @@ the bar at the bottom is clickable and always works.`);
     }
 
     if (dest === wp.cwd) { new Notice('Source and target directory are identical.'); return; }
-    const run = () => this.transferSelection(sel, dest, 'copy');
+    // single file → offer a rename in the dialog; multiple → keep their names
+    const run = (renameTo) => this.transferSelection(sel, dest, 'copy', renameTo);
     if (this.plugin.settings.confirmCopy) {
-      new ConfirmModal(this.app, {
-        title: 'Copy', body: `Copy ${sel.length} object(s) to\n${dest}?`, onConfirm: run,
+      new CopyModal(this.app, {
+        count: sel.length,
+        destDir: dest,
+        name: sel.length === 1 ? sel[0].name : null,
+        onConfirm: (renameTo) => run(renameTo),
       }).open();
-    } else run();
+    } else run(null);
+  }
+
+  // Copy / Cut the current selection to the commander's file clipboard (Cmd+C /
+  // Cmd+X). Copy also exposes the paths on the OS clipboard (best effort).
+  actFileCopy() { this._fileClipSet('copy'); }
+  actFileCut()  { this._fileClipSet('move'); }
+  _fileClipSet(mode) {
+    const wp = this.workPanel();
+    if (!wp) { new Notice('No file panel active.'); return; }
+    if (wp.zip) { new Notice('Cannot ' + (mode === 'move' ? 'cut' : 'copy') + ' from inside an archive.'); return; }
+    const sel = this.getSelection(wp);
+    if (!sel.length) return;
+    this.fileClip = { mode, files: sel.map((f) => ({ name: f.name, full: f.full })) };
+    if (mode === 'copy' && this.fp.writeClipboardFiles) this.fp.writeClipboardFiles(sel.map((f) => f.full));
+    // remember the OS clipboard state now, so a later paste can tell whether
+    // the user has since copied something else in Finder (which should win)
+    this.fileClip.osSig = (this.fp.clipboardFiles ? this.fp.clipboardFiles() : []).join(' ');
+    new Notice(`${mode === 'move' ? 'Cut' : 'Copied'} ${sel.length} item(s) to clipboard.`);
+  }
+
+  // Copy the selected entries' paths to the OS text clipboard (absolute on the
+  // node build, vault-relative resolved against the vault base otherwise).
+  async actCopyPath() {
+    const wp = this.workPanel();
+    if (!wp) { new Notice('No file panel active.'); return; }
+    const sel = this.getSelection(wp);
+    if (!sel.length) return;
+
+    const paths = sel.map((f) => {
+      if (f.full == null) return '';
+      if (this.fp.capabilities.absolutePaths) return f.full;
+      const base = this.app.vault.adapter && this.app.vault.adapter.basePath;
+      return base ? this.P.join(base, f.full) : f.full;
+    }).filter(Boolean);
+
+    if (!paths.length) { new Notice('Cannot copy paths from an archive.'); return; }
+
+    try {
+      await navigator.clipboard.writeText(paths.join('\n'));
+      new Notice(`Copied ${paths.length} path(s) to clipboard.`);
+    } catch (e) {
+      new Notice('Clipboard error: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  // Pick a non-colliding "<base> copy" name for duplicating a file into its own
+  // folder (e.g. note.md → "note copy.md" → "note copy 2.md").
+  async _dupName(dir, name) {
+    const dot = name.lastIndexOf('.');
+    const hasExt = dot > 0;
+    const base = hasExt ? name.slice(0, dot) : name;
+    const ext = hasExt ? name.slice(dot) : '';
+    for (let i = 1; ; i++) {
+      const cand = i === 1 ? `${base} copy${ext}` : `${base} copy ${i}${ext}`;
+      if (!(await this.fp.exists(this.P.join(dir, cand)))) return cand;
+    }
+  }
+
+  // Cmd/Ctrl+V — paste into the active panel's folder. Prefers the commander's
+  // own file clipboard (Copy/Cut), then files from the OS file manager, then a
+  // raster image on the clipboard (saved as a new PNG).
+  async actPaste() {
+    const wp = this.workPanel();
+    if (!wp) { new Notice('No file panel active.'); return; }
+    if (wp.zip) { new Notice('Cannot paste into an archive.'); return; }
+    const destDir = wp.cwd;
+    const osFiles = this.fp.clipboardFiles ? this.fp.clipboardFiles() : [];
+    const clip = this.fileClip;
+    // the internal clipboard wins, UNLESS it was a Copy and the user has since
+    // copied something different in Finder (then that newer OS copy wins)
+    const osChanged = osFiles.length && (!clip || osFiles.join(' ') !== clip.osSig);
+
+    // 1) the commander's own clipboard (Copy = duplicate, Cut = move once)
+    if (clip && clip.files.length && !(clip.mode === 'copy' && osChanged)) {
+      const mode = clip.mode;
+      const files = clip.files;
+      if (mode === 'move') {
+        const moved = files.filter((f) => this.P.dirname(f.full) !== destDir);
+        if (!moved.length) { new Notice('Already in this folder.'); return; }
+        await this.transferSelection(moved, destDir, 'move');
+        this.fileClip = null;   // Cut is one-shot
+        return;
+      }
+      // Copy: pasting into the source folder duplicates (file → "file copy"),
+      // rather than offering to overwrite the file with itself.
+      const inPlace = files.filter((f) => this.P.dirname(f.full) === destDir);
+      const elsewhere = files.filter((f) => this.P.dirname(f.full) !== destDir);
+      if (elsewhere.length) await this.transferSelection(elsewhere, destDir, 'copy');
+      for (const f of inPlace) {
+        const dup = await this._dupName(destDir, f.name);
+        await this.transferSelection([f], destDir, 'copy', dup);
+      }
+      return;
+    }
+
+    // 2) files/folders from the OS file manager (Finder / Explorer)
+    if (osFiles.length) {
+      const sel = osFiles.map((full) => ({ name: this.P.basename(full), full }));
+      const realDest = sel.filter((f) => this.P.dirname(f.full) !== destDir);
+      if (!realDest.length) { new Notice('Those files are already in this folder.'); return; }
+      await this.transferSelection(realDest, destDir, 'copy');
+      return;
+    }
+
+    // 3) a raster image on the clipboard → write a fresh PNG
+    const png = this.fp.clipboardImage && this.fp.clipboardImage();
+    if (png) {
+      let n = 0, name, target;
+      do { name = 'pasted-image' + (n ? `-${n}` : '') + '.png'; target = this.P.join(destDir, name); n++; }
+      while (await this.fp.exists(target));
+      try {
+        await this.fp.writeBinary(target, png);
+        await this.refresh();
+        new Notice('Pasted image as ' + name);
+      } catch (e) { new Notice('Could not save image: ' + (e && e.message ? e.message : e)); }
+      return;
+    }
+
+    new Notice('Clipboard has no file or image to paste.');
+  }
+
+  // Rename a single entry within its folder, refusing to clobber an existing
+  // sibling. Copy/move have their own conflict prompts, but a bare rename does
+  // not — and fs.renameSync would silently overwrite the target. A case-only
+  // change on a case-insensitive filesystem targets the same object, so allow it.
+  async renameEntry(f, wp, name) {
+    if (!name || name === f.name) return;
+    const target = this.P.join(wp.cwd, name);
+    const caseOnly = name.toLowerCase() === f.name.toLowerCase();
+    if (!caseOnly && (await this.fp.exists(target))) {
+      new Notice(`An object named "${name}" already exists.`);
+      return;
+    }
+    try { await this.fp.rename(f.full, target); await this.refresh(); }
+    catch (e) { new Notice('Error: ' + e.message); }
+  }
+
+  actRenameInPlace() {
+    const wp = this.workPanel();
+    if (!wp) { new Notice('No file panel active.'); return; }
+    if (wp.zip) { new Notice('Rename inside an archive is not possible.'); return; }
+    const sel = this.getSelection(wp);
+    if (!sel.length) return;
+    if (sel.length !== 1) { new Notice('Select only one object to rename.'); return; }
+    const f = sel[0];
+    new PromptModal(this.app, {
+      title: 'Rename', value: f.name,
+      // for files, pre-select only the name so the extension is preserved
+      selectBasename: !(f.en && f.en.isDir),
+      validate: (name) => invalidNameReason(name),
+      onSubmit: (name) => this.renameEntry(f, wp, name),
+    }).open();
   }
 
   actMove() {
@@ -1112,17 +1407,17 @@ the bar at the bottom is clickable and always works.`);
       const f = sel[0];
       new PromptModal(this.app, {
         title: 'Rename', value: f.name,
+        // for files, pre-select only the name so the extension is preserved
+        selectBasename: !(f.en && f.en.isDir),
         validate: (name) => invalidNameReason(name),
-        onSubmit: async (name) => {
-          if (!name || name === f.name) return;
-          try { await this.fp.rename(f.full, this.P.join(wp.cwd, name)); await this.refresh(); }
-          catch (e) { new Notice('Error: ' + e.message); }
-        },
+        onSubmit: (name) => this.renameEntry(f, wp, name),
       }).open();
       return;
     }
+    const displayDest = dest.length > 55 ? '...' + dest.slice(-52) : dest;
     new ConfirmModal(this.app, {
-      title: 'Move', body: `Move ${sel.length} object(s) to\n${dest}?`,
+      title: 'Move', body: `Move ${sel.length} object(s) to ${displayDest}?`,
+      nowrap: true,
       onConfirm: () => this.transferSelection(sel, dest, 'move'),
     }).open();
   }
@@ -1134,13 +1429,15 @@ the bar at the bottom is clickable and always works.`);
   askName(value) {
     return new Promise((resolve) => { new PromptModal(this.app, { title: 'Rename to', value, onSubmit: (v) => resolve(v) }).open(); });
   }
-  async transferSelection(sel, destDir, mode) {
+  async transferSelection(sel, destDir, mode, renameSingle) {
     // shared state: counts files (not top-level objects) and the all/cancel flags,
     // which carry through the whole operation including into nested folders
     const st = { overwriteAll: false, skipAll: false, created: 0, overwritten: 0, skipped: 0, failed: 0, cancelled: false };
     for (const f of sel) {
       if (st.cancelled) break;
-      await this.transferEntry(f.full, this.P.join(destDir, f.name), f.name, mode, st);
+      // a single-file copy may have been renamed in the dialog
+      const name = (renameSingle && sel.length === 1) ? renameSingle : f.name;
+      await this.transferEntry(f.full, this.P.join(destDir, name), name, mode, st);
     }
     // explicit, file-accurate summary so the chosen action is clear
     const verb = mode === 'copy' ? 'copied' : 'moved';
@@ -1304,6 +1601,20 @@ the bar at the bottom is clickable and always works.`);
       { label: 'Unselect all', run: () => this.clearTags() },
     ];
   }
+  // clipboard file operations — same actions the desktop Edit menu / Cmd+X·C·V
+  // drive. Copy/Cut remember the selection; Paste drops it into the active panel.
+  editItems() {
+    const k = (typeof process !== 'undefined' && process.platform === 'darwin') ? '⌘' : 'Ctrl+';
+    return [
+      { label: 'Cut'.padEnd(18) + k + 'X', run: () => this.actFileCut() },
+      { label: 'Copy'.padEnd(18) + k + 'C', run: () => this.actFileCopy() },
+      { label: 'Paste'.padEnd(18) + k + 'V', run: () => this.actPaste() },
+      { sep: true },
+      { label: 'Rename in place   Ctrl+R', run: () => this.actRenameInPlace() },
+      { sep: true },
+      { label: 'Copy path', run: () => this.actCopyPath() },
+    ];
+  }
   commandsItems() {
     const items = [
       { label: 'Swap panels', run: () => this.swapPanels() },
@@ -1322,6 +1633,8 @@ the bar at the bottom is clickable and always works.`);
   optionsItems() {
     const s = this.plugin.settings;
     const items = [
+      { label: 'Configuration…', run: () => this.openConfig() },
+      { sep: true },
       { label: 'Confirm deletions', checked: s.confirmDelete, run: () => this.toggleSetting('confirmDelete') },
       { label: 'Confirm copies', checked: s.confirmCopy, run: () => this.toggleSetting('confirmCopy') },
     ];
@@ -1350,10 +1663,640 @@ the bar at the bottom is clickable and always works.`);
     return [
       { label: 'Left', items: this.panelMenuItems(this.left) },
       { label: 'Files', items: this.filesItems() },
+      { label: 'Edit', items: this.editItems() },
       { label: 'Commands', items: this.commandsItems() },
       { label: 'Options', items: this.optionsItems() },
+      { label: 'Tools', items: this.toolsItems() },
       { label: 'Right', items: this.panelMenuItems(this.right) },
     ];
+  }
+
+  toolsItems() {
+    return [
+      { label: 'Calendar', run: () => this.openCalendar() },
+      { label: 'Calculator', run: () => this.openCalculator() },
+      { label: 'ASCII Chart', run: () => this.openAscii() },
+      { label: 'Symbols Chart', run: () => this.openSymbols() },
+      { sep: true },
+      { label: 'Puzzle', run: () => this.openPuzzle() },
+      { label: 'Tetris', run: () => this.openTetris() },
+    ];
+  }
+
+  openConfig() {
+    if (this.menu) this.closeMenu();
+    this.menu = { kind: 'config', focusItem: 2 };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  openConfigScreensaver() {
+    if (this.menu) { this.popMenuScope(); if (this.overlayEl) { this.overlayEl.remove(); this.overlayEl = null; } this.menu = null; }
+    const s = this.plugin.settings;
+    this.menu = { kind: 'config-screensaver', enabled: s.screensaverEnabled, name: s.screensaverName, delay: s.screensaverDelay };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  saveConfigScreensaver() {
+    const m = this.menu;
+    this.plugin.settings.screensaverEnabled = m.enabled;
+    this.plugin.settings.screensaverName = m.name;
+    this.plugin.settings.screensaverDelay = m.delay;
+    this.plugin.saveSettings();
+    this.resetScreensaverTimer();
+    this.closeMenu();
+  }
+
+  initScreensaverSystem() {
+    this._ssCanvas = null;
+    this._ssAnimFrame = null;
+    this._ssIdleTimer = null;
+    if (!this.rootEl) return;
+    // Screensaver fires after N minutes with mouse OUTSIDE the commander window.
+    // mouseenter cancels the countdown and stops any running screensaver.
+    this.rootEl.addEventListener('mouseleave', () => this._ssArmTimer());
+    this.rootEl.addEventListener('mouseenter', () => {
+      this._ssCancelTimer();
+      this.stopScreensaver();
+    });
+    // Any activity inside the view also dismisses a running saver — needed when
+    // it was started with the pointer already inside (e.g. the "Test" button),
+    // where mouseenter never fires. Keyboard is handled via onKey → _ssWake().
+    const wake = () => this._ssWake();
+    this.rootEl.addEventListener('mousemove', wake);
+    this.rootEl.addEventListener('mousedown', wake);
+    this.rootEl.addEventListener('wheel', wake, { passive: true });
+    this.rootEl.addEventListener('touchstart', wake, { passive: true });
+  }
+
+  // Stop a running screensaver on user activity. Returns true if one was showing
+  // (so a key press that woke it is swallowed rather than acted on).
+  _ssWake() {
+    if (!this._ssCanvas) return false;
+    this._ssCancelTimer();
+    this.stopScreensaver();
+    return true;
+  }
+
+  _ssArmTimer() {
+    this._ssCancelTimer();
+    if (!this.plugin.settings.screensaverEnabled) return;
+    const ms = Math.max(1, this.plugin.settings.screensaverDelay || 1) * 60000;
+    this._ssIdleTimer = window.setTimeout(() => this.startScreensaver(), ms);
+  }
+
+  _ssCancelTimer() {
+    if (this._ssIdleTimer) { window.clearTimeout(this._ssIdleTimer); this._ssIdleTimer = null; }
+  }
+
+  resetScreensaverTimer() {
+    // Called after settings change — just cancel any pending timer.
+    // The timer re-arms next time the mouse leaves the window.
+    this._ssCancelTimer();
+  }
+
+  startScreensaver(nameOverride) {
+    if (this._ssCanvas) return;
+    if (!this.rootEl) return;
+    const w = this.rootEl.offsetWidth, h = this.rootEl.offsetHeight;
+    if (!w || !h) return;
+    const canvas = document.createElement('canvas');
+    canvas.className = 'nc-screensaver';
+    canvas.width = w;
+    canvas.height = h;
+    this.rootEl.appendChild(canvas);
+    this._ssCanvas = canvas;
+    const name = nameOverride || this.plugin.settings.screensaverName || 'matrix';
+    if (name === 'starnight')       this._ssStarnight(canvas);
+    else if (name === 'lines')     this._ssLines(canvas);
+    else if (name === 'polygons')  this._ssPolygons(canvas);
+    else if (name === 'fireworks') this._ssFireworks(canvas);
+    else if (name === 'worms')     this._ssWorms(canvas);
+    else if (name === 'tiles')     this._ssTiles(canvas);
+    else                           this._ssStarnight(canvas);
+  }
+
+  stopScreensaver() {
+    if (this._ssAnimFrame) { cancelAnimationFrame(this._ssAnimFrame); this._ssAnimFrame = null; }
+    if (this._ssCanvas) { this._ssCanvas.remove(); this._ssCanvas = null; }
+  }
+
+  // ── Turbo Vision / CGA shared helpers ─────────────────────────
+  _tvSetup(canvas) {
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const CW = Math.max(6, Math.floor(W / 80));
+    const CH = CW * 2;
+    const COLS = Math.floor(W / CW);
+    const ROWS = Math.floor(H / CH);
+    ctx.font = `${CH}px "Px437 IBM VGA8","PxPlus IBM VGA8","Perfect DOS VGA 437","Consolas",monospace`;
+    ctx.textBaseline = 'top';
+    return { ctx, W, H, CW, CH, COLS, ROWS };
+  }
+
+  // CGA 16-color palette
+  _cga() {
+    return ['#000000','#0000aa','#00aa00','#00aaaa','#aa0000','#aa00aa','#aa5500','#aaaaaa',
+            '#555555','#5555ff','#55ff55','#55ffff','#ff5555','#ff55ff','#ffff55','#ffffff'];
+  }
+
+  // Draw a fake Norton Commander screen (for destructive screensavers)
+  _drawNCScreen(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    const putCell = (ch, c, r, fg, bg) => {
+      ctx.fillStyle = CGA[bg];
+      ctx.fillRect(c * CW, r * CH, CW, CH);
+      if (ch !== ' ' && ch !== '') {
+        ctx.fillStyle = CGA[fg];
+        ctx.fillText(ch, c * CW, r * CH);
+      }
+    };
+    const putStr = (str, c, r, fg, bg) => {
+      for (let i = 0; i < str.length && c + i < COLS; i++) putCell(str[i], c + i, r, fg, bg);
+    };
+    const fillRect = (c, r, w, h, bg) => {
+      ctx.fillStyle = CGA[bg];
+      ctx.fillRect(c * CW, r * CH, w * CW, h * CH);
+    };
+
+    fillRect(0, 0, COLS, ROWS, 1); // blue background
+
+    // Menu bar (cyan, row 0)
+    fillRect(0, 0, COLS, 1, 3);
+    putStr(' Left   Files   Edit   Commands   Options   Tools   Right', 0, 0, 0, 3);
+
+    const PW = Math.floor((COLS - 1) / 2); // panel width
+    const RP = PW + 1;                      // right panel start col
+
+    // Panel borders (row 1..ROWS-3)
+    const drawBox = (c, r, w, h, fg) => {
+      putStr('╔' + '═'.repeat(w - 2) + '╗', c, r, fg, 1);
+      for (let i = r + 1; i < r + h - 1; i++) {
+        putCell('║', c, i, fg, 1);
+        putCell('║', c + w - 1, i, fg, 1);
+      }
+      putStr('╚' + '═'.repeat(w - 2) + '╝', c, r + h - 1, fg, 1);
+    };
+    const panelH = ROWS - 3;
+    drawBox(0, 1, PW, panelH, 11);
+    drawBox(RP, 1, COLS - RP, panelH, 11);
+
+    // Column header (row 2)
+    const hdr = ' Name' + ' '.repeat(PW - 15) + '   Size    Date ';
+    putStr(hdr.slice(0, PW - 2), 1, 2, 14, 1);
+    putStr(hdr.slice(0, COLS - RP - 2), RP + 1, 2, 14, 1);
+
+    // Left file entries
+    const leftFiles = [
+      ['../','', 14], ['Documents/','', 14], ['Pictures/','', 14], ['Projects/','', 14],
+      ['README.md','  2 048  11.05', 15], ['config.yaml','    512  08.03', 15],
+      ['notes.txt','  4 096  22.06', 15], ['archive.zip',' 1.2 MB  01.01', 7],
+      ['photo.jpg','  8 192  15.04', 7],  ['script.sh','    256  30.05', 15],
+    ];
+    for (let i = 0; i < panelH - 4 && i < leftFiles.length; i++) {
+      const [name, info, fg] = leftFiles[i];
+      const entry = (' ' + name).padEnd(PW - 2 - info.length) + info;
+      putStr(entry.slice(0, PW - 2), 1, 3 + i, fg, 1);
+    }
+    // Right file entries
+    const rightFiles = [
+      ['../','', 14], ['vault-commander/','', 14], ['node_modules/','', 14],
+      ['src/','', 14], ['desktop/','', 14], ['dist/','', 14],
+      ['package.json','    908  29.06', 15], ['build.mjs','  3 584  29.06', 15],
+      ['styles.css',' 45 056  29.06', 15], ['variants.json','    280  10.03', 15],
+    ];
+    for (let i = 0; i < panelH - 4 && i < rightFiles.length; i++) {
+      const [name, info, fg] = rightFiles[i];
+      const rw = COLS - RP - 2;
+      const entry = (' ' + name).padEnd(rw - info.length) + info;
+      putStr(entry.slice(0, rw), RP + 1, 3 + i, fg, 1);
+    }
+
+    // Command line (ROWS - 2)
+    putStr('C:\\>', 0, ROWS - 2, 7, 1);
+
+    // Function key bar (ROWS - 1, black)
+    fillRect(0, ROWS - 1, COLS, 1, 0);
+    putStr('1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit', 0, ROWS - 1, 15, 0);
+  }
+
+  // ── Screensaver 1: Starry Night (NC4 style) ───────────────────
+  _ssStarnight(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    const STAR_CHARS = ['.', '+', '*', '\xF9', '\xFA']; // · and ░ CP437 fallback
+    const STAR_COLS  = [15, 15, 14, 11, 7];
+    // Sparse grid: null = empty, {ch, fg} = star
+    const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+    // Seed ~3% of cells with stars
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++)
+        if (Math.random() < 0.03) {
+          const si = Math.floor(Math.random() * STAR_CHARS.length);
+          grid[r][c] = { ch: STAR_CHARS[si], fg: STAR_COLS[si] };
+        }
+
+    const drawCell = (c, r) => {
+      ctx.fillStyle = CGA[0];
+      ctx.fillRect(c * CW, r * CH, CW, CH);
+      if (grid[r][c]) {
+        ctx.fillStyle = CGA[grid[r][c].fg];
+        ctx.fillText(grid[r][c].ch, c * CW, r * CH);
+      }
+    };
+    // Initial draw
+    ctx.fillStyle = CGA[0];
+    ctx.fillRect(0, 0, W, H);
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (grid[r][c]) drawCell(c, r);
+
+    let frame = 0;
+    const tick = () => {
+      if (this._ssCanvas !== canvas) return;
+      frame++;
+      if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+      const n = Math.max(1, Math.floor(COLS * ROWS * 0.004));
+      for (let i = 0; i < n; i++) {
+        const r = Math.floor(Math.random() * ROWS);
+        const c = Math.floor(Math.random() * COLS);
+        if (grid[r][c]) grid[r][c] = null;
+        else if (Math.random() < 0.5) {
+          const si = Math.floor(Math.random() * STAR_CHARS.length);
+          grid[r][c] = { ch: STAR_CHARS[si], fg: STAR_COLS[si] };
+        }
+        drawCell(c, r);
+      }
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+    this._ssAnimFrame = requestAnimationFrame(tick);
+  }
+
+  // ── Screensaver 2: Floating Lines (colored scanlines) ─────────
+  _ssLines(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    // Horizontal "scanlines" made of '─' that drift up/down
+    const LINE_FG  = [9, 11, 10, 14, 12, 13, 3]; // bright CGA colors
+    const scanlines = Array.from({ length: 7 }, (_, i) => ({
+      row: Math.floor(Math.random() * ROWS),
+      fg:  LINE_FG[i],
+      dy:  Math.random() < 0.5 ? 1 : -1,
+      speed: 1 + Math.floor(Math.random() * 3),
+      tick: 0,
+    }));
+    ctx.fillStyle = CGA[1]; // blue bg
+    ctx.fillRect(0, 0, W, H);
+
+    const drawLine = (row, fg, bg) => {
+      ctx.fillStyle = CGA[bg];
+      ctx.fillRect(0, row * CH, W, CH);
+      ctx.fillStyle = CGA[fg];
+      for (let c = 0; c < COLS; c++) ctx.fillText('─', c * CW, row * CH); // ─
+    };
+
+    let frame = 0;
+    const tick = () => {
+      if (this._ssCanvas !== canvas) return;
+      frame++;
+      if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+      for (const s of scanlines) {
+        drawLine(s.row, 1, 1); // erase (blue on blue)
+        s.tick++;
+        if (s.tick >= s.speed) {
+          s.tick = 0;
+          s.row += s.dy;
+          if (s.row < 0)       { s.row = 0;       s.dy = 1; }
+          if (s.row >= ROWS)   { s.row = ROWS - 1; s.dy = -1; }
+        }
+        drawLine(s.row, s.fg, 1); // draw
+      }
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+    // Initial draw
+    for (const s of scanlines) drawLine(s.row, s.fg, 1);
+    this._ssAnimFrame = requestAnimationFrame(tick);
+  }
+
+  // ── Screensaver 3: Moving Polygons (flying boxes) ─────────────
+  _ssPolygons(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    ctx.fillStyle = CGA[1];
+    ctx.fillRect(0, 0, W, H);
+
+    const BOX_FG = [9, 11, 10, 14, 12, 13];
+    const boxes = Array.from({ length: 5 }, (_, i) => {
+      const bw = 6 + Math.floor(Math.random() * 14);
+      const bh = 4 + Math.floor(Math.random() * 8);
+      return {
+        col: Math.floor(Math.random() * (COLS - bw)),
+        row: Math.floor(Math.random() * (ROWS - bh)),
+        w: bw, h: bh,
+        dc: Math.random() < 0.5 ? 1 : -1,
+        dr: Math.random() < 0.5 ? 1 : -1,
+        fg: BOX_FG[i],
+        speed: 1 + Math.floor(Math.random() * 2),
+        tick: 0,
+      };
+    });
+
+    // Draw a box of double-line chars at col,row with given fg
+    const drawBox = (b, fg) => {
+      const { col: c, row: r, w, h } = b;
+      ctx.fillStyle = CGA[fg];
+      ctx.fillText('╔', c * CW, r * CH);                       // ╔
+      ctx.fillText('╗', (c + w - 1) * CW, r * CH);             // ╗
+      ctx.fillText('╚', c * CW, (r + h - 1) * CH);             // ╚
+      ctx.fillText('╝', (c + w - 1) * CW, (r + h - 1) * CH);  // ╝
+      for (let i = 1; i < w - 1; i++) {
+        ctx.fillText('═', (c + i) * CW, r * CH);               // ═
+        ctx.fillText('═', (c + i) * CW, (r + h - 1) * CH);
+      }
+      for (let i = 1; i < h - 1; i++) {
+        ctx.fillText('║', c * CW, (r + i) * CH);               // ║
+        ctx.fillText('║', (c + w - 1) * CW, (r + i) * CH);
+      }
+    };
+    const eraseBox = (b) => {
+      ctx.fillStyle = CGA[1];
+      ctx.fillRect(b.col * CW, b.row * CH, b.w * CW, b.h * CH);
+    };
+
+    for (const b of boxes) drawBox(b, b.fg);
+
+    let frame = 0;
+    const tick = () => {
+      if (this._ssCanvas !== canvas) return;
+      frame++;
+      if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+      for (const b of boxes) {
+        b.tick++;
+        if (b.tick < b.speed) continue;
+        b.tick = 0;
+        eraseBox(b);
+        b.col += b.dc; b.row += b.dr;
+        if (b.col <= 0 || b.col + b.w >= COLS) b.dc *= -1;
+        if (b.row <= 0 || b.row + b.h >= ROWS) b.dr *= -1;
+        b.col = Math.max(0, Math.min(COLS - b.w, b.col));
+        b.row = Math.max(0, Math.min(ROWS - b.h, b.row));
+        drawBox(b, b.fg);
+      }
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+    this._ssAnimFrame = requestAnimationFrame(tick);
+  }
+
+  // ── Screensaver 4: Fireworks (character-mode) ──────────────────
+  _ssFireworks(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    const BURST_FG = [9, 11, 10, 14, 12, 13, 15]; // bright colors
+    const SPARKS = ['▒', '*', '+', '.', '\xF9']; // ▒ * + . ·
+    const particles = [];
+
+    const explode = () => {
+      const cc = 2 + Math.floor(Math.random() * (COLS - 4));
+      const cr = 1 + Math.floor(Math.random() * (ROWS - 2));
+      const fg = BURST_FG[Math.floor(Math.random() * BURST_FG.length)];
+      // Starburst pattern in several rings
+      const DIRS = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,-1],[-1,1],[1,1]];
+      for (const [dc, dr] of DIRS) {
+        for (let r = 1; r <= 3 + Math.floor(Math.random() * 3); r++) {
+          particles.push({ c: cc + dc * r, r: cr + dr * r, fg, life: 12 + Math.floor(Math.random() * 8), ch: SPARKS[Math.min(r - 1, SPARKS.length - 1)] });
+        }
+      }
+    };
+
+    ctx.fillStyle = CGA[0];
+    ctx.fillRect(0, 0, W, H);
+
+    let nextBoom = 3;
+    let frame = 0;
+    const tick = () => {
+      if (this._ssCanvas !== canvas) return;
+      frame++;
+      if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+      nextBoom--;
+      if (nextBoom <= 0) {
+        explode();
+        nextBoom = 3 + Math.floor(Math.random() * 5);
+      }
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        // Erase old position
+        if (p.c >= 0 && p.c < COLS && p.r >= 0 && p.r < ROWS) {
+          ctx.fillStyle = CGA[0];
+          ctx.fillRect(p.c * CW, p.r * CH, CW, CH);
+        }
+        p.life--;
+        if (p.life <= 0) { particles.splice(i, 1); continue; }
+        // Draw if in bounds
+        if (p.c >= 0 && p.c < COLS && p.r >= 0 && p.r < ROWS) {
+          ctx.fillStyle = CGA[0];
+          ctx.fillRect(p.c * CW, p.r * CH, CW, CH);
+          ctx.fillStyle = CGA[p.life > 8 ? p.fg : 7];
+          ctx.fillText(p.ch, p.c * CW, p.r * CH);
+        }
+      }
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+    this._ssAnimFrame = requestAnimationFrame(tick);
+  }
+
+  // ── Screensaver 5: Worms — destructive (eats NC screen) ───────
+  _ssWorms(canvas) {
+    const { ctx, W, H, CW, CH, COLS, ROWS } = this._tvSetup(canvas);
+    const CGA = this._cga();
+    const WORM_CHARS = ['O', '0', 'o'];
+    const WORM_FG    = [10, 11, 12, 14, 9]; // bright green, cyan, red, yellow, blue
+    const DIRS = [[1,0],[-1,0],[0,1],[0,-1]];
+    const eaten = new Set();
+
+    const borderPos = () => {
+      const side = Math.floor(Math.random() * 4);
+      if (side === 0) return { c: 0,        r: Math.floor(Math.random() * ROWS), dir: 0 };
+      if (side === 1) return { c: COLS - 1, r: Math.floor(Math.random() * ROWS), dir: 1 };
+      if (side === 2) return { c: Math.floor(Math.random() * COLS), r: 0,        dir: 2 };
+                      return { c: Math.floor(Math.random() * COLS), r: ROWS - 1, dir: 3 };
+    };
+
+    const worms = Array.from({ length: 6 }, (_, i) => {
+      const pos = borderPos();
+      // First 3: straight (prefer current dir), last 3: random walk
+      return { c: pos.c, r: pos.r, dir: pos.dir, fg: WORM_FG[i % WORM_FG.length], ch: WORM_CHARS[i % WORM_CHARS.length], tick: 0, random: i >= 3 };
+    });
+
+    // Shuffle array in-place (Fisher-Yates) — used for random-walk direction order
+    const shuffle = (arr) => {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    };
+
+    const startAnim = () => {
+      let frame = 0;
+      const tick = () => {
+        if (this._ssCanvas !== canvas) return;
+        frame++;
+        if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+        for (const w of worms) {
+          w.tick++;
+          if (w.tick % 2 !== 0) continue;
+          const key = `${w.c},${w.r}`;
+          eaten.add(key);
+          ctx.fillStyle = CGA[0];
+          ctx.fillRect(w.c * CW, w.r * CH, CW, CH);
+          ctx.fillStyle = CGA[w.fg];
+          ctx.fillText(w.ch, w.c * CW, w.r * CH);
+
+          // Straight worms: prefer current direction, only turn when blocked.
+          // Random-walk worms: try directions in random order each step.
+          const order = w.random
+            ? shuffle([0, 1, 2, 3])
+            : [0, 1, 2, 3].map(i => (w.dir + i) % 4);
+          let moved = false;
+          for (const d of order) {
+            const [dc, dr] = DIRS[d];
+            const nc = w.c + dc, nr = w.r + dr;
+            if (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS && !eaten.has(`${nc},${nr}`)) {
+              w.dir = d; w.c = nc; w.r = nr; moved = true; break;
+            }
+          }
+          if (!moved) { // trapped — reset at border
+            const pos = borderPos();
+            w.c = pos.c; w.r = pos.r; w.dir = pos.dir;
+          }
+        }
+        this._ssAnimFrame = requestAnimationFrame(tick);
+      };
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+
+    // Electron desktop: capture real screenshot as background, then start worms on top.
+    // Obsidian plugin variants use the fake TV screen instead.
+    const isDesktopElectron = typeof window !== 'undefined' && window.__vc && !!window.__vc.nativeEditMenu;
+    if (isDesktopElectron) {
+      try {
+        const { ipcRenderer } = require('electron');
+        ipcRenderer.invoke('vc-capture').then(buf => {
+          if (!buf || this._ssCanvas !== canvas) return;
+          const blob = new Blob([buf], { type: 'image/png' });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            URL.revokeObjectURL(url);
+            if (this._ssCanvas !== canvas) return;
+            ctx.drawImage(img, 0, 0, W, H);
+            startAnim();
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(); }
+          };
+          img.src = url;
+        }).catch(() => {
+          if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(); }
+        });
+      } catch (e) {
+        this._drawNCScreen(canvas);
+        startAnim();
+      }
+      return;
+    }
+
+    this._drawNCScreen(canvas);
+    startAnim();
+  }
+
+  // ── Screensaver 6: Screen Shuffle — sliding-puzzle random walk ─
+  _ssTiles(canvas) {
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const TCOLS = 30, TROWS = 20;
+    const TW = Math.floor(W / TCOLS), TH = Math.floor(H / TROWS);
+    const N = TCOLS * TROWS;
+    const DIRS4 = [[-1,0],[1,0],[0,-1],[0,1]];
+
+    const startAnim = (snap) => {
+      // grid[pos] = source tile index at that display position; -1 = hole
+      const grid = Array.from({ length: N }, (_, i) => i);
+      let hole = Math.floor(Math.random() * N);
+      grid[hole] = -1;
+
+      const drawTile = (dstPos, srcIdx) => {
+        const sx = (srcIdx % TCOLS) * TW, sy = Math.floor(srcIdx / TCOLS) * TH;
+        const dx = (dstPos % TCOLS) * TW, dy = Math.floor(dstPos / TCOLS) * TH;
+        ctx.putImageData(snap, dx - sx, dy - sy, sx, sy, TW, TH);
+      };
+      const clearPos = (pos) => {
+        ctx.fillStyle = '#000000';
+        ctx.fillRect((pos % TCOLS) * TW, Math.floor(pos / TCOLS) * TH, TW, TH);
+      };
+
+      clearPos(hole);
+
+      let frame = 0;
+      const tick = () => {
+        if (this._ssCanvas !== canvas) return;
+        frame++;
+        if (frame % 20 !== 0) { this._ssAnimFrame = requestAnimationFrame(tick); return; }
+        // 3 slides per rendered frame (~9 slides/sec at 3 fps)
+        for (let s = 0; s < 3; s++) {
+          const hc = hole % TCOLS, hr = Math.floor(hole / TCOLS);
+          const adj = [];
+          for (const [dc, dr] of DIRS4) {
+            const nc = hc + dc, nr = hr + dr;
+            if (nc >= 0 && nc < TCOLS && nr >= 0 && nr < TROWS) adj.push(nr * TCOLS + nc);
+          }
+          const next = adj[Math.floor(Math.random() * adj.length)];
+          drawTile(hole, grid[next]);
+          grid[hole] = grid[next];
+          grid[next] = -1;
+          clearPos(next);
+          hole = next;
+        }
+        this._ssAnimFrame = requestAnimationFrame(tick);
+      };
+      this._ssAnimFrame = requestAnimationFrame(tick);
+    };
+
+    // Electron desktop: use real screenshot as source image.
+    // Obsidian plugin variants use the fake TV screen instead.
+    const isDesktopElectron = typeof window !== 'undefined' && window.__vc && !!window.__vc.nativeEditMenu;
+    if (isDesktopElectron) {
+      try {
+        const { ipcRenderer } = require('electron');
+        ipcRenderer.invoke('vc-capture').then(buf => {
+          if (!buf || this._ssCanvas !== canvas) return;
+          const blob = new Blob([buf], { type: 'image/png' });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            URL.revokeObjectURL(url);
+            if (this._ssCanvas !== canvas) return;
+            ctx.drawImage(img, 0, 0, W, H);
+            startAnim(ctx.getImageData(0, 0, W, H));
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(ctx.getImageData(0, 0, W, H)); }
+          };
+          img.src = url;
+        }).catch(() => {
+          if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(ctx.getImageData(0, 0, W, H)); }
+        });
+      } catch (e) {
+        this._drawNCScreen(canvas);
+        startAnim(ctx.getImageData(0, 0, W, H));
+      }
+      return;
+    }
+
+    this._drawNCScreen(canvas);
+    startAnim(ctx.getImageData(0, 0, W, H));
   }
 
   // persistent top menu bar — shown only when "Hide menu" is off, as its own
@@ -1369,6 +2312,18 @@ the bar at the bottom is clickable and always works.`);
       c.addEventListener('mousedown', (e) => { e.preventDefault(); this.openDockedCat(ci); });
       c.addEventListener('mouseenter', () => { if (this.menu && this.menu.docked) this.openDockedCat(ci); });
     });
+    const clock = bar.createSpan({ cls: 'nc-menu-clock' });
+    clock.addEventListener('mousedown', (e) => { e.preventDefault(); this.openCalendar(); });
+    this.updateClock();
+  }
+
+  updateClock() {
+    if (!this.rootEl) return;
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const txt = `${pad(d.getDate())}.${pad(d.getMonth()+1)}.${d.getFullYear()}  ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const clocks = this.rootEl.querySelectorAll('.nc-menu-clock');
+    for (let i = 0; i < clocks.length; i++) clocks[i].textContent = txt;
   }
 
   toggleHideMenu() {
@@ -1388,7 +2343,7 @@ the bar at the bottom is clickable and always works.`);
 
   openPulldown() {
     if (this.menu) { this.closeMenu(); return; }
-    const startCat = (this.active === this.left) ? 0 : 4;   // open on the active panel's side
+    const startCat = (this.active === this.left) ? 0 : 6;   // open on the active panel's side (6 = Right)
     if (!this.plugin.settings.hideMenu) { this.openDockedCat(startCat); return; }
     this.menu = { kind: 'pulldown', cats: this.menuCats(), cat: startCat, item: 0 };
     this.skipToSelectable(1);
@@ -1396,11 +2351,422 @@ the bar at the bottom is clickable and always works.`);
     this.pushMenuScope();
   }
 
+  openCalendar() {
+    if (this.menu) { this.closeMenu(); return; }
+    this.menu = { kind: 'calendar', date: new Date(), focusItem: 0 };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  changeCalendarMonth(dir) {
+    if (this.menu.kind !== 'calendar') return;
+    const d = this.menu.date;
+    this.menu.date = new Date(d.getFullYear(), d.getMonth() + dir, 1);
+    this.renderMenu();
+  }
+
+  openCalculator() {
+    if (this.menu) { this.closeMenu(); return; }
+    this.menu = { kind: 'calculator', disp: '0', op: null, val: null, clearNext: false, focusItem: 0 };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  calcPress(b) {
+    if (this.menu.kind !== 'calculator') return;
+    const m = this.menu;
+    if (b === 'C') { m.disp = '0'; m.op = null; m.val = null; m.clearNext = false; }
+    else if (b === '←') { m.disp = m.disp.length > 1 ? m.disp.slice(0, -1) : '0'; }
+    else if (b === '±') { m.disp = m.disp.startsWith('-') ? m.disp.slice(1) : '-' + m.disp; }
+    else if (b === '%') { m.disp = String(parseFloat(m.disp) / 100); }
+    else if ('0123456789'.includes(b)) {
+      if (m.clearNext || m.disp === '0') { m.disp = b; m.clearNext = false; }
+      else { m.disp += b; }
+    }
+    else if (b === '.') {
+      if (m.clearNext) { m.disp = '0.'; m.clearNext = false; }
+      else if (!m.disp.includes('.')) m.disp += '.';
+    }
+    else if ('+-*/'.includes(b)) {
+      if (m.op && !m.clearNext) this.calcEval();
+      m.val = parseFloat(m.disp);
+      m.op = b;
+      m.clearNext = true;
+    }
+    else if (b === '=') {
+      if (m.op) this.calcEval();
+      m.op = null;
+    }
+    this.renderMenu();
+  }
+
+  calcEval() {
+    const m = this.menu;
+    const v1 = m.val;
+    const v2 = parseFloat(m.disp);
+    let r = 0;
+    if (m.op === '+') r = v1 + v2;
+    if (m.op === '-') r = v1 - v2;
+    if (m.op === '*') r = v1 * v2;
+    if (m.op === '/') {
+      if (v2 === 0) { m.disp = 'Error'; m.clearNext = true; return; }
+      r = v1 / v2;
+    }
+    m.disp = String(Math.round(r * 1e8) / 1e8);
+    m.clearNext = true;
+  }
+
+  /* --- ASCII Chart --- */
+  openAscii() {
+    if (this.menu) { this.closeMenu(); return; }
+    this.menu = { kind: 'ascii', val: 0 };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  getAsciiChar(i) {
+    const cp437 = " ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼ !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~⌂ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+    return cp437[i] || ' ';
+  }
+
+  copyAsciiChar() {
+    const ch = this.getAsciiChar(this.menu.val);
+    navigator.clipboard.writeText(ch).then(
+      () => new Notice('Copied ' + (ch === ' ' ? '(space)' : ch)),
+      () => new Notice('Clipboard unavailable.'),
+    );
+  }
+
+  /* --- Symbols Chart --- */
+  openSymbols() {
+    if (this.menu) { this.closeMenu(); return; }
+    this.menu = { kind: 'symbols', val: 0, picked: false };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  // Curated Unicode symbols useful for text editing. Each entry is [char, name].
+  // Grid is SYM_COLS wide (keep in sync with renderMenu + keyboard handling).
+  getSymbols() {
+    return [
+      // Checks & boxes
+      ['✓', 'Check mark'], ['✔', 'Heavy check mark'], ['✗', 'Ballot X'], ['✘', 'Heavy ballot X'],
+      ['☑', 'Checked box'], ['☒', 'Crossed box'], ['☐', 'Ballot box'], ['⌫', 'Erase left'],
+      // Stars, bullets & shapes
+      ['★', 'Black star'], ['☆', 'White star'], ['•', 'Bullet'], ['◦', 'White bullet'],
+      ['‣', 'Triangular bullet'], ['⁃', 'Hyphen bullet'], ['●', 'Black circle'], ['○', 'White circle'],
+      ['■', 'Black square'], ['□', 'White square'], ['▪', 'Small black square'], ['▫', 'Small white square'],
+      ['◆', 'Black diamond'], ['◇', 'White diamond'], ['♥', 'Heart'], ['♦', 'Diamond'],
+      // Arrows
+      ['←', 'Left arrow'], ['→', 'Right arrow'], ['↑', 'Up arrow'], ['↓', 'Down arrow'],
+      ['↔', 'Left-right arrow'], ['↕', 'Up-down arrow'], ['⇐', 'Left double arrow'], ['⇒', 'Right double arrow'],
+      ['⇑', 'Up double arrow'], ['⇓', 'Down double arrow'], ['⇔', 'Left-right double arrow'], ['↩', 'Return arrow'],
+      ['➜', 'Heavy arrow'], ['➤', 'Arrowhead'], ['»', 'Right guillemet'], ['«', 'Left guillemet'],
+      // Legal & marks
+      ['©', 'Copyright'], ['®', 'Registered'], ['™', 'Trademark'], ['℠', 'Service mark'],
+      ['℗', 'Sound recording copyright'], ['§', 'Section'], ['¶', 'Pilcrow'], ['†', 'Dagger'],
+      ['‡', 'Double dagger'], ['*', 'Asterisk'], ['№', 'Numero'], ['%', 'Percent'],
+      // Typography / punctuation
+      ['—', 'Em dash'], ['–', 'En dash'], ['…', 'Ellipsis'], ['·', 'Middle dot'],
+      ['“', 'Left double quote'], ['”', 'Right double quote'], ['‘', 'Left single quote'], ['’', 'Right single quote'],
+      ['‹', 'Single left guillemet'], ['›', 'Single right guillemet'], ['′', 'Prime'], ['″', 'Double prime'],
+      // Currency
+      ['€', 'Euro'], ['£', 'Pound'], ['¥', 'Yen'], ['¢', 'Cent'],
+      ['$', 'Dollar'], ['₩', 'Won'], ['₹', 'Rupee'], ['₽', 'Ruble'],
+      // Math
+      ['×', 'Multiplication'], ['÷', 'Division'], ['±', 'Plus-minus'], ['∓', 'Minus-plus'],
+      ['≈', 'Almost equal'], ['≠', 'Not equal'], ['≤', 'Less-or-equal'], ['≥', 'Greater-or-equal'],
+      ['∞', 'Infinity'], ['√', 'Square root'], ['∑', 'Sum'], ['∏', 'Product'],
+      ['∫', 'Integral'], ['∆', 'Delta'], ['∂', 'Partial'], ['µ', 'Micro'],
+      ['π', 'Pi'], ['°', 'Degree'], ['‰', 'Per mille'], ['∙', 'Bullet operator'],
+      ['½', 'One half'], ['¼', 'One quarter'], ['¾', 'Three quarters'], ['⅓', 'One third'],
+      // Misc editing
+      ['⚠', 'Warning'], ['⚡', 'Lightning'], ['☀', 'Sun'], ['☺', 'Smiley'],
+      ['♪', 'Note'], ['♫', 'Notes'], ['✉', 'Envelope'], ['✏', 'Pencil'],
+      ['✂', 'Scissors'], ['⌘', 'Command'], ['⌥', 'Option'], ['⇧', 'Shift'],
+    ];
+  }
+
+  copySymbolChar() {
+    const ch = this.getSymbols()[this.menu.val][0];
+    navigator.clipboard.writeText(ch).then(
+      () => new Notice('Copied ' + ch),
+      () => new Notice('Clipboard unavailable.'),
+    );
+  }
+
+  /* --- Puzzle --- */
+  openPuzzle() {
+    if (this.menu) { this.closeMenu(); return; }
+    let tiles = ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O',''];
+    let emptyIdx = 15;
+    for (let i = 0; i < 300; i++) {
+      const valid = [];
+      if (emptyIdx >= 4) valid.push(emptyIdx - 4);
+      if (emptyIdx < 12) valid.push(emptyIdx + 4);
+      if (emptyIdx % 4 !== 0) valid.push(emptyIdx - 1);
+      if (emptyIdx % 4 !== 3) valid.push(emptyIdx + 1);
+      const move = valid[Math.floor(Math.random() * valid.length)];
+      tiles[emptyIdx] = tiles[move];
+      tiles[move] = '';
+      emptyIdx = move;
+    }
+    this.menu = { kind: 'puzzle', tiles, moves: 0, emptyIdx };
+    this.renderMenu();
+    this.pushMenuScope();
+  }
+
+  puzzleMove(idx) {
+    if (this.menu.kind !== 'puzzle') return;
+    const m = this.menu;
+    const isAdj = (idx === m.emptyIdx - 1 && idx % 4 !== 3) || 
+                  (idx === m.emptyIdx + 1 && idx % 4 !== 0) || 
+                  (idx === m.emptyIdx - 4) || 
+                  (idx === m.emptyIdx + 4);
+    if (isAdj) {
+      m.tiles[m.emptyIdx] = m.tiles[idx];
+      m.tiles[idx] = '';
+      m.emptyIdx = idx;
+      m.moves++;
+      this.renderMenu();
+    }
+  }
+
+  puzzleKeyMove(dir) {
+    if (this.menu.kind !== 'puzzle') return;
+    const eIdx = this.menu.emptyIdx;
+    let target = -1;
+    if (dir === 'Right' && eIdx % 4 !== 0) target = eIdx - 1;
+    if (dir === 'Left' && eIdx % 4 !== 3) target = eIdx + 1;
+    if (dir === 'Up' && eIdx < 12) target = eIdx + 4;
+    if (dir === 'Down' && eIdx >= 4) target = eIdx - 4;
+    if (target !== -1) this.puzzleMove(target);
+  }
+
+  /* --- Tetris --- */
+  openTetris() {
+    if (this.menu) { this.closeMenu(); return; }
+    this.menu = {
+      kind: 'tetris',
+      board: Array.from({length: 20}, () => Array(10).fill(0)),
+      score: 0, lines: 0, level: 1,
+      active: null, next: this.randomTetromino(),
+      gameOver: false, timer: null
+    };
+    
+    // Mobile Touch Controls
+    this.tetrisTouchStartX = 0;
+    this.tetrisTouchStartY = 0;
+    this.tetrisHasSwiped = false;
+    this.tetrisHardDropped = false;
+    this.boundTetrisTouchStart = (e) => {
+      if (e.touches.length > 1) return;
+      this.tetrisTouchStartX = e.touches[0].clientX;
+      this.tetrisTouchStartY = e.touches[0].clientY;
+      this.tetrisHasSwiped = false;
+      this.tetrisHardDropped = false;
+    };
+    this.boundTetrisTouchMove = (e) => {
+      if (e.touches.length > 1 || !this.tetrisTouchStartX || !this.tetrisTouchStartY) return;
+      const currentX = e.touches[0].clientX;
+      const currentY = e.touches[0].clientY;
+      const dx = currentX - this.tetrisTouchStartX;
+      const dy = currentY - this.tetrisTouchStartY;
+      const SWIPE_STEP = 24; // Pixels per grid movement
+      
+      if (Math.abs(dx) >= SWIPE_STEP) {
+        this.tetrisHasSwiped = true;
+        const steps = Math.floor(Math.abs(dx) / SWIPE_STEP);
+        for (let i = 0; i < steps; i++) this.tetrisMove(dx > 0 ? 1 : -1, 0);
+        this.tetrisTouchStartX += (dx > 0 ? steps * SWIPE_STEP : -steps * SWIPE_STEP);
+      }
+      
+      if (dy >= SWIPE_STEP) {
+        this.tetrisHasSwiped = true;
+        const steps = Math.floor(dy / SWIPE_STEP);
+        for (let i = 0; i < steps; i++) this.tetrisMove(0, 1);
+        this.tetrisTouchStartY += steps * SWIPE_STEP;
+      } else if (dy <= -50 && !this.tetrisHardDropped) {
+        this.tetrisHasSwiped = true;
+        this.tetrisHardDropped = true;
+        this.tetrisHardDrop();
+      }
+    };
+    this.boundTetrisTouchEnd = (e) => {
+      if (!this.tetrisHasSwiped && this.tetrisTouchStartX && this.tetrisTouchStartY) {
+        if (e.target.closest('.nc-tetris')) {
+          this.tetrisRotate();
+          if (e.cancelable) e.preventDefault();
+        }
+      }
+      this.tetrisTouchStartX = 0;
+      this.tetrisTouchStartY = 0;
+    };
+    
+    document.addEventListener('touchstart', this.boundTetrisTouchStart, { passive: true });
+    document.addEventListener('touchmove', this.boundTetrisTouchMove, { passive: true });
+    document.addEventListener('touchend', this.boundTetrisTouchEnd, { passive: false });
+
+    this.spawnTetrisPiece();
+    this.renderMenu();
+    this.pushMenuScope();
+    this.menu.timer = window.setInterval(() => this.tetrisTick(), this.tetrisSpeed());
+  }
+
+  tetrisSpeed() { return Math.max(100, 800 - (this.menu.level - 1) * 70); }
+
+  randomTetromino() {
+    const pieces = [
+      { shape: [[1,1,1,1]], color: 1 }, // I
+      { shape: [[2,0,0],[2,2,2]], color: 2 }, // J
+      { shape: [[0,0,3],[3,3,3]], color: 3 }, // L
+      { shape: [[4,4],[4,4]], color: 4 }, // O
+      { shape: [[0,5,5],[5,5,0]], color: 5 }, // S
+      { shape: [[0,6,0],[6,6,6]], color: 6 }, // T
+      { shape: [[7,7,0],[0,7,7]], color: 7 }  // Z
+    ];
+    return pieces[Math.floor(Math.random() * pieces.length)];
+  }
+
+  spawnTetrisPiece() {
+    const m = this.menu;
+    m.active = { shape: m.next.shape, color: m.next.color, x: Math.floor((10 - m.next.shape[0].length) / 2), y: 0 };
+    m.next = this.randomTetromino();
+    if (this.tetrisCollision(m.active.x, m.active.y, m.active.shape)) {
+      m.gameOver = true;
+      if (m.timer) window.clearInterval(m.timer);
+    }
+  }
+
+  tetrisTick() {
+    if (this.menu.kind !== 'tetris' || this.menu.gameOver) return;
+    if (!this.tetrisMove(0, 1)) this.tetrisLock();
+  }
+
+  tetrisMove(dx, dy) {
+    const m = this.menu;
+    if (this.tetrisCollision(m.active.x + dx, m.active.y + dy, m.active.shape)) return false;
+    m.active.x += dx;
+    m.active.y += dy;
+    this.updateTetrisDOM();
+    return true;
+  }
+
+  tetrisRotate() {
+    const m = this.menu;
+    const s = m.active.shape;
+    const rot = s[0].map((val, index) => s.map(row => row[index]).reverse());
+    if (!this.tetrisCollision(m.active.x, m.active.y, rot)) {
+      m.active.shape = rot;
+      this.updateTetrisDOM();
+    }
+  }
+
+  tetrisCollision(x, y, shape) {
+    const m = this.menu;
+    for (let r = 0; r < shape.length; r++) {
+      for (let c = 0; c < shape[r].length; c++) {
+        if (!shape[r][c]) continue;
+        let nx = x + c, ny = y + r;
+        if (nx < 0 || nx >= 10 || ny >= 20) return true;
+        if (ny >= 0 && m.board[ny][nx]) return true;
+      }
+    }
+    return false;
+  }
+
+  tetrisLock() {
+    const m = this.menu;
+    const shape = m.active.shape;
+    for (let r = 0; r < shape.length; r++) {
+      for (let c = 0; c < shape[r].length; c++) {
+        if (shape[r][c]) m.board[m.active.y + r][m.active.x + c] = m.active.color;
+      }
+    }
+    let cleared = 0;
+    for (let r = 19; r >= 0; r--) {
+      if (m.board[r].every(cell => cell > 0)) {
+        m.board.splice(r, 1);
+        m.board.unshift(Array(10).fill(0));
+        cleared++; r++;
+      }
+    }
+    if (cleared > 0) {
+      m.lines += cleared;
+      m.score += [0, 40, 100, 300, 1200][cleared] * m.level;
+      if (m.lines >= m.level * 10) {
+        m.level++;
+        if (m.timer) window.clearInterval(m.timer);
+        m.timer = window.setInterval(() => this.tetrisTick(), this.tetrisSpeed());
+      }
+    }
+    this.spawnTetrisPiece();
+    this.updateTetrisDOM();
+  }
+
+  tetrisHardDrop() {
+    while (this.tetrisMove(0, 1)) {}
+    this.tetrisLock();
+  }
+
+  updateTetrisDOM() {
+    if (!this.overlayEl) return;
+    const m = this.menu;
+    if (m.kind !== 'tetris') return;
+    
+    const boardEl = this.overlayEl.querySelector('.nc-tetris-board');
+    if (!boardEl) return;
+    
+    const displayBoard = m.board.map(row => [...row]);
+    if (m.active) {
+      for (let r = 0; r < m.active.shape.length; r++) {
+        for (let c = 0; c < m.active.shape[r].length; c++) {
+          if (m.active.shape[r][c]) {
+            const y = m.active.y + r, x = m.active.x + c;
+            if (y >= 0 && y < 20 && x >= 0 && x < 10) displayBoard[y][x] = m.active.color;
+          }
+        }
+      }
+    }
+    
+    let i = 0;
+    const cells = boardEl.children;
+    displayBoard.forEach(row => {
+      row.forEach(cell => {
+        cells[i].className = 'nc-tetris-cell c' + cell;
+        i++;
+      });
+    });
+    
+    const scoreEls = this.overlayEl.querySelectorAll('.nc-tetris-sidebar > div:not(.label)');
+    if (scoreEls.length >= 3) {
+      scoreEls[0].textContent = String(m.score);
+      scoreEls[1].textContent = String(m.level);
+      scoreEls[2].textContent = String(m.lines);
+    }
+    
+    const previewEl = this.overlayEl.querySelector('.nc-tetris-preview');
+    if (previewEl) {
+      let pi = 0;
+      const pcells = previewEl.children;
+      for (let r = 0; r < 2; r++) {
+        for (let c = 0; c < 4; c++) {
+          const isFilled = m.next.shape[r] && m.next.shape[r][c];
+          pcells[pi].className = 'nc-tetris-cell c' + (isFilled ? m.next.color : '0');
+          pi++;
+        }
+      }
+    }
+    
+    if (m.gameOver && !this.overlayEl.querySelector('.nc-tetris-over')) {
+      this.overlayEl.querySelector('.nc-tetris').createDiv({ cls: 'nc-tetris-over', text: 'GAME OVER' });
+    }
+  }
+
   openUserMenu() {
     if (this.menu) { this.closeMenu(); return; }
     const items = [];
     if (this.fp.capabilities.absolutePaths) items.push({ label: 'Home directory (~)', run: () => this.gotoPath(this.fp.homeDir()) });
-    else items.push({ label: 'Toggle theme (Blue / Gray)', run: () => this.toggleTheme() });
     items.push({ label: 'Vault folder', run: () => this.gotoVault() });
     if (this.fp.capabilities.absolutePaths) items.push({ label: 'Root directory /', run: () => this.gotoPath(this.P.root(this.active.cwd)) });
     items.push({ sep: true });
@@ -1410,6 +2776,7 @@ the bar at the bottom is clickable and always works.`);
     items.push({ label: 'Equalize panels', run: () => this.equalizePanels() });
     items.push({ label: 'Swap panels', run: () => this.swapPanels() });
     items.push({ sep: true });
+    items.push({ label: 'Toggle theme (Blue / Gray)', run: () => this.toggleTheme() });
     items.push({ label: 'Toggle fullscreen' + (hotkeyLabel(this.plugin.settings.fullscreenHotkey) ? `  (${hotkeyLabel(this.plugin.settings.fullscreenHotkey)})` : ''), run: () => this.toggleFullscreen() });
     this.menu = { kind: 'list', title: 'User menu', items, item: 0 };
     this.skipToSelectable(1);
@@ -1452,15 +2819,257 @@ the bar at the bottom is clickable and always works.`);
           this.menu.cat = ci; this.menu.item = 0; this.skipToSelectable(1); this.renderMenu();
         });
       });
+      const clock = bar.createSpan({ cls: 'nc-menu-clock' });
+      clock.addEventListener('mousedown', (e) => { e.preventDefault(); this.openCalendar(); });
+      this.updateClock();
       const drop = ov.createDiv({ cls: 'nc-dropdown' });
       const activeCatEl = bar.children[this.menu.cat];
       if (activeCatEl) drop.style.left = activeCatEl.offsetLeft + 'px';
       this.fillMenuItems(drop, this.menu.cats[this.menu.cat].items);
+    } else if (this.menu.kind === 'calendar') {
+      const box = ov.createDiv({ cls: 'nc-calendar' });
+      box.createDiv({ cls: 'nc-calendar-title', text: ' Calendar ' });
+      const hdr = box.createDiv({ cls: 'nc-calendar-hdr' });
+      
+      const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+      const monStr = `${monthNames[this.menu.date.getMonth()]} ${this.menu.date.getFullYear()}`;
+      
+      const btnPrev = hdr.createSpan({ cls: 'nc-cal-btn' + (this.menu.focusItem === 0 ? ' nc-sel' : ''), text: '▲' });
+      hdr.createSpan({ cls: 'nc-cal-month', text: monStr });
+      const btnNext = hdr.createSpan({ cls: 'nc-cal-btn' + (this.menu.focusItem === 1 ? ' nc-sel' : ''), text: '▼' });
+      
+      btnPrev.addEventListener('mousedown', (e) => { e.preventDefault(); this.changeCalendarMonth(-1); });
+      btnNext.addEventListener('mousedown', (e) => { e.preventDefault(); this.changeCalendarMonth(1); });
+
+      const grid = box.createDiv({ cls: 'nc-cal-grid' });
+      const days = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+      days.forEach(d => grid.createSpan({ cls: 'nc-cal-day-hdr', text: d }));
+
+      const d = this.menu.date;
+      const first = new Date(d.getFullYear(), d.getMonth(), 1);
+      const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      const today = new Date();
+      
+      for (let i = 0; i < first.getDay(); i++) {
+        grid.createSpan({ text: '' });
+      }
+      for (let i = 1; i <= last.getDate(); i++) {
+        const isToday = today.getDate() === i && today.getMonth() === d.getMonth() && today.getFullYear() === d.getFullYear();
+        grid.createSpan({ cls: 'nc-cal-day' + (isToday ? ' nc-today' : ''), text: String(i) });
+      }
+    } else if (this.menu.kind === 'calculator') {
+      const box = ov.createDiv({ cls: 'nc-calculator' });
+      box.createDiv({ cls: 'nc-calculator-title', text: ' Calculator ' });
+      const disp = box.createDiv({ cls: 'nc-calc-disp', text: this.menu.disp });
+      const grid = box.createDiv({ cls: 'nc-calc-grid' });
+      const btns = [
+        ['C','←','%','±'],
+        ['7','8','9','/'],
+        ['4','5','6','*'],
+        ['1','2','3','-'],
+        ['0','.','=','+']
+      ];
+      btns.forEach((row, ri) => {
+        row.forEach((b, ci) => {
+          const isFocused = this.menu.focusItem === (ri * 4 + ci);
+          const btn = grid.createDiv({ cls: 'nc-calc-btn' + (isFocused ? ' nc-sel' : ''), text: b });
+          btn.addEventListener('mousedown', (e) => { e.preventDefault(); this.calcPress(b); });
+        });
+      });
+    } else if (this.menu.kind === 'ascii') {
+      const box = ov.createDiv({ cls: 'nc-ascii' });
+      box.createDiv({ cls: 'nc-ascii-title', text: ' ASCII Chart ' });
+      const grid = box.createDiv({ cls: 'nc-ascii-grid' });
+      for (let i = 0; i < 256; i++) {
+        const cell = grid.createDiv({ cls: 'nc-ascii-cell' + (this.menu.val === i ? ' nc-sel' : '') });
+        cell.createSpan({ cls: 'nc-ascii-char', text: this.getAsciiChar(i) });
+        cell.addEventListener('mousedown', (e) => { e.preventDefault(); this.menu.val = i; this.menu.picked = true; this.renderMenu(); });
+      }
+      const info = box.createDiv({ cls: 'nc-ascii-info' });
+      info.textContent = `Char: ${this.getAsciiChar(this.menu.val)}   Decimal: ${String(this.menu.val).padStart(3, ' ')} Hex: ${this.menu.val.toString(16).toUpperCase().padStart(2, '0')}`;
+      if (this.menu.picked) {
+        const btnRow = box.createDiv({ cls: 'nc-ascii-btnrow' });
+        const copyBtn = btnRow.createDiv({ cls: 'nc-config-okbtn', text: 'Copy' });
+        copyBtn.addEventListener('mousedown', (e) => { e.preventDefault(); this.copyAsciiChar(); });
+      }
+    } else if (this.menu.kind === 'symbols') {
+      const box = ov.createDiv({ cls: 'nc-ascii nc-symbols' });
+      box.createDiv({ cls: 'nc-ascii-title', text: ' Symbols Chart ' });
+      const syms = this.getSymbols();
+      const grid = box.createDiv({ cls: 'nc-ascii-grid nc-symbols-grid' });
+      syms.forEach((s, i) => {
+        const cell = grid.createDiv({ cls: 'nc-ascii-cell' + (this.menu.val === i ? ' nc-sel' : '') });
+        cell.createSpan({ cls: 'nc-ascii-char', text: s[0] });
+        cell.addEventListener('mousedown', (e) => { e.preventDefault(); this.menu.val = i; this.menu.picked = true; this.renderMenu(); });
+      });
+      const sel = syms[this.menu.val];
+      const cp = sel[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0');
+      const info = box.createDiv({ cls: 'nc-ascii-info' });
+      info.textContent = `Char: ${sel[0]}   ${sel[1]}   U+${cp}`;
+      if (this.menu.picked) {
+        const btnRow = box.createDiv({ cls: 'nc-ascii-btnrow' });
+        const copyBtn = btnRow.createDiv({ cls: 'nc-config-okbtn', text: 'Copy' });
+        copyBtn.addEventListener('mousedown', (e) => { e.preventDefault(); this.copySymbolChar(); });
+      }
+    } else if (this.menu.kind === 'puzzle') {
+      const box = ov.createDiv({ cls: 'nc-puzzle' });
+      box.createDiv({ cls: 'nc-puzzle-title', text: ' Puzzle ' });
+      const layout = box.createDiv({ cls: 'nc-puzzle-layout' });
+      const grid = layout.createDiv({ cls: 'nc-puzzle-grid' });
+      this.menu.tiles.forEach((t, i) => {
+        const tile = grid.createDiv({ cls: 'nc-puzzle-tile' + (t === '' ? ' empty' : ''), text: t });
+        if (t !== '') tile.addEventListener('mousedown', (e) => { e.preventDefault(); this.puzzleMove(i); });
+      });
+      const sidebar = layout.createDiv({ cls: 'nc-puzzle-sidebar' });
+      sidebar.createDiv({ text: 'Move' });
+      sidebar.createDiv({ text: String(this.menu.moves), cls: 'nc-puzzle-moves' });
+    } else if (this.menu.kind === 'tetris') {
+      const box = ov.createDiv({ cls: 'nc-tetris' });
+      box.createDiv({ cls: 'nc-tetris-title', text: ' Tetris ' });
+      const layout = box.createDiv({ cls: 'nc-tetris-layout' });
+      const boardEl = layout.createDiv({ cls: 'nc-tetris-board' });
+      const m = this.menu;
+      const displayBoard = m.board.map(row => [...row]);
+      if (m.active) {
+        for (let r = 0; r < m.active.shape.length; r++) {
+          for (let c = 0; c < m.active.shape[r].length; c++) {
+            if (m.active.shape[r][c]) {
+              const y = m.active.y + r, x = m.active.x + c;
+              if (y >= 0 && y < 20 && x >= 0 && x < 10) displayBoard[y][x] = m.active.color;
+            }
+          }
+        }
+      }
+      displayBoard.forEach(row => row.forEach(cell => boardEl.createDiv({ cls: 'nc-tetris-cell c' + cell })));
+      const sidebar = layout.createDiv({ cls: 'nc-tetris-sidebar' });
+      sidebar.createDiv({ cls: 'label', text: 'Score' });
+      sidebar.createDiv({ text: String(m.score) });
+      sidebar.createDiv({ cls: 'label', text: 'Level' });
+      sidebar.createDiv({ text: String(m.level) });
+      sidebar.createDiv({ cls: 'label', text: 'Lines' });
+      sidebar.createDiv({ text: String(m.lines) });
+      sidebar.createDiv({ cls: 'label', text: 'Next' });
+      const preview = sidebar.createDiv({ cls: 'nc-tetris-preview' });
+      for (let r = 0; r < 2; r++) {
+        for (let c = 0; c < 4; c++) {
+          const isFilled = m.next.shape[r] && m.next.shape[r][c];
+          preview.createDiv({ cls: 'nc-tetris-cell c' + (isFilled ? m.next.color : '0') });
+        }
+      }
+      if (m.gameOver) box.createDiv({ cls: 'nc-tetris-over', text: 'GAME OVER' });
+    } else if (this.menu.kind === 'config' || this.menu.kind === 'config-screensaver') {
+      this._renderConfigDialog(ov);
+      if (this.menu.kind === 'config-screensaver') this._renderScreensaverDialog(ov);
     } else {
       const box = ov.createDiv({ cls: 'nc-usermenu' });
       box.createDiv({ cls: 'nc-usermenu-title', text: this.menu.title });
       this.fillMenuItems(box, this.menu.items);
     }
+  }
+
+  _renderConfigDialog(ov) {
+    const m = this.menu;
+    const inactive = m.kind === 'config-screensaver';
+    const box = ov.createDiv({ cls: 'nc-config-dialog' + (inactive ? ' nc-config-inactive' : '') });
+    box.createDiv({ cls: 'nc-config-title', text: ' Configuration ' });
+
+    const CONFIG_ITEMS = [
+      { label: 'Screen',        desc: 'Select screen options',             active: false },
+      { label: 'Panel Options', desc: 'Configure Commander Panels',        active: false },
+      { label: 'Screen Savers', desc: 'Configure Screen Savers',           active: true  },
+      { label: 'Printer/mouse', desc: 'Configure printer & mouse options', active: false },
+      { label: 'Editor',        desc: 'Select Editor Options',             active: false },
+      { label: 'Confirmations', desc: 'Set/Reset Program Prompts',        active: false },
+      { label: 'Compression',   desc: 'Configure Commander Compression',   active: false },
+    ];
+
+    const list = box.createDiv({ cls: 'nc-config-list' });
+    CONFIG_ITEMS.forEach((item, i) => {
+      const row = list.createDiv({ cls: 'nc-config-row' });
+      const btnCls = 'nc-config-btn' +
+        (item.active ? '' : ' nc-config-btn-disabled') +
+        (!inactive && item.active && i === m.focusItem ? ' nc-sel' : '');
+      const btn = row.createDiv({ cls: btnCls });
+      btn.textContent = item.label;
+      row.createDiv({ cls: 'nc-config-desc' + (item.active ? '' : ' nc-config-dim') }).textContent = item.desc;
+      if (!inactive && item.active) {
+        btn.addEventListener('mousedown', (e) => { e.preventDefault(); this.openConfigScreensaver(); });
+      }
+    });
+
+    const footer = box.createDiv({ cls: 'nc-config-footer' });
+    footer.createDiv({ cls: 'nc-config-checkbox nc-config-dim' }).textContent = '[x] Auto save setup';
+
+    const btnRow = box.createDiv({ cls: 'nc-config-btnrow' });
+    const makeBtn = (label, fn) => {
+      const b = btnRow.createDiv({ cls: 'nc-config-okbtn' + (inactive ? ' nc-config-dim' : '') });
+      b.textContent = label;
+      if (!inactive) b.addEventListener('mousedown', (e) => { e.preventDefault(); fn(); });
+    };
+    makeBtn('Ok', () => this.closeMenu());
+    makeBtn('Cancel', () => this.closeMenu());
+  }
+
+  _renderScreensaverDialog(ov) {
+    const m = this.menu;
+    const SAVERS = [
+      { id: 'starnight', label: 'Starry Night'    },
+      { id: 'lines',     label: 'Floating Lines'  },
+      { id: 'polygons',  label: 'Moving Polygons' },
+      { id: 'fireworks', label: 'Fireworks'       },
+      { id: 'worms',     label: 'Worms'           },
+      { id: 'tiles',     label: 'Screen Shuffle'  },
+    ];
+
+    const box = ov.createDiv({ cls: 'nc-config-ss-dialog' });
+    box.createDiv({ cls: 'nc-config-ss-title', text: ' Screen Savers ' });
+
+    const frame = box.createDiv({ cls: 'nc-config-ss-frame' });
+    frame.createDiv({ cls: 'nc-config-ss-framelabel', text: 'Screen Saver' });
+
+    const grid = frame.createDiv({ cls: 'nc-config-ss-grid' });
+    SAVERS.forEach((s) => {
+      const row = grid.createDiv({ cls: 'nc-config-ss-row' });
+      const radio = row.createSpan({ cls: 'nc-config-radio' + (m.name === s.id ? ' nc-sel' : '') });
+      radio.textContent = m.name === s.id ? '(●)' : '( )';
+      const lbl = row.createSpan({ cls: 'nc-config-ss-label' + (m.name === s.id ? ' nc-config-ss-active' : '') });
+      lbl.textContent = ' ' + s.label;
+      row.addEventListener('mousedown', (e) => { e.preventDefault(); m.name = s.id; this.renderMenu(); });
+    });
+
+    const opts = box.createDiv({ cls: 'nc-config-ss-opts' });
+    const chkRow = opts.createDiv({ cls: 'nc-config-ss-chkrow' });
+    const chk = chkRow.createSpan({ cls: 'nc-config-radio' });
+    chk.textContent = m.enabled ? '[x]' : '[ ]';
+    chkRow.createSpan().textContent = '  Use screen saver';
+    chkRow.addEventListener('mousedown', (e) => { e.preventDefault(); m.enabled = !m.enabled; this.renderMenu(); });
+
+    const delayRow = opts.createDiv({ cls: 'nc-config-ss-chkrow' });
+    const minus = delayRow.createSpan({ cls: 'nc-config-ss-spin' });
+    minus.textContent = '[◄]';
+    minus.addEventListener('mousedown', (e) => { e.preventDefault(); if (m.delay > 1) { m.delay--; this.renderMenu(); } });
+    const delayVal = delayRow.createSpan({ cls: 'nc-config-ss-delayval' });
+    delayVal.textContent = ' ' + m.delay + ' ';
+    const plus = delayRow.createSpan({ cls: 'nc-config-ss-spin' });
+    plus.textContent = '[►]';
+    plus.addEventListener('mousedown', (e) => { e.preventDefault(); if (m.delay < 99) { m.delay++; this.renderMenu(); } });
+    delayRow.createSpan().textContent = '  Minutes';
+
+    const btnRow = box.createDiv({ cls: 'nc-config-btnrow nc-config-ss-btnrow' });
+    const okBtn = btnRow.createDiv({ cls: 'nc-config-okbtn' });
+    okBtn.textContent = 'Ok';
+    okBtn.addEventListener('mousedown', (e) => { e.preventDefault(); this.saveConfigScreensaver(); });
+    const testBtn = btnRow.createDiv({ cls: 'nc-config-okbtn' });
+    testBtn.textContent = 'Test';
+    testBtn.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const name = m.name;
+      this.closeMenu();
+      window.setTimeout(() => this.startScreensaver(name), 50);
+    });
+    const cancelBtn = btnRow.createDiv({ cls: 'nc-config-okbtn' });
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('mousedown', (e) => { e.preventDefault(); this.openConfig(); });
   }
 
   fillMenuItems(container, items) {
@@ -1481,6 +3090,120 @@ the bar at the bottom is clickable and always works.`);
   }
 
   menuKey(e) {
+    if (this.menu.kind === 'calendar') {
+      e.preventDefault(); e.stopPropagation();
+      switch (e.key) {
+        case 'Escape': this.closeMenu(); break;
+        case 'Tab':
+        case 'ArrowRight':
+        case 'ArrowLeft':
+          this.menu.focusItem = 1 - this.menu.focusItem;
+          this.renderMenu();
+          break;
+        case 'Enter':
+        case ' ':
+          this.changeCalendarMonth(this.menu.focusItem === 0 ? -1 : 1);
+          break;
+        case 'ArrowUp': this.changeCalendarMonth(-1); break;
+        case 'ArrowDown': this.changeCalendarMonth(1); break;
+      }
+      return;
+    }
+    if (this.menu.kind === 'calculator') {
+      e.preventDefault(); e.stopPropagation();
+      const btns = ['C','←','%','±','7','8','9','/','4','5','6','*','1','2','3','-','0','.','=','+'];
+      switch (e.key) {
+        case 'Escape': this.closeMenu(); break;
+        case 'Tab':
+        case 'ArrowRight': this.menu.focusItem = (this.menu.focusItem + 1) % 20; this.renderMenu(); break;
+        case 'ArrowLeft': this.menu.focusItem = (this.menu.focusItem - 1 + 20) % 20; this.renderMenu(); break;
+        case 'ArrowDown': this.menu.focusItem = (this.menu.focusItem + 4) % 20; this.renderMenu(); break;
+        case 'ArrowUp': this.menu.focusItem = (this.menu.focusItem - 4 + 20) % 20; this.renderMenu(); break;
+        case ' ': this.calcPress(btns[this.menu.focusItem]); break;
+        case 'Enter': this.calcPress('='); break;
+        case 'Backspace': this.calcPress('←'); break;
+        case 'Delete':
+        case 'c':
+        case 'C': this.calcPress('C'); break;
+        default:
+          if (btns.includes(e.key)) this.calcPress(e.key);
+          break;
+      }
+      return;
+    }
+    if (this.menu.kind === 'ascii') {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === 'Escape') { this.closeMenu(); return; }
+      if (e.key === 'Enter') { if (this.menu.picked) this.copyAsciiChar(); else this.closeMenu(); return; }
+      let c = this.menu.val;
+      if (e.key === 'ArrowRight') c = (c + 1) % 256;
+      else if (e.key === 'ArrowLeft') c = (c - 1 + 256) % 256;
+      else if (e.key === 'ArrowDown') c = (c + 32) % 256;
+      else if (e.key === 'ArrowUp') c = (c - 32 + 256) % 256;
+      if (c !== this.menu.val) { this.menu.val = c; this.menu.picked = true; this.renderMenu(); }
+      return;
+    }
+    if (this.menu.kind === 'symbols') {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === 'Escape') { this.closeMenu(); return; }
+      if (e.key === 'Enter') { if (this.menu.picked) this.copySymbolChar(); else this.closeMenu(); return; }
+      const len = this.getSymbols().length;
+      const COLS = 16;   // keep in sync with .nc-symbols-grid columns
+      let c = this.menu.val;
+      if (e.key === 'ArrowRight') c = (c + 1) % len;
+      else if (e.key === 'ArrowLeft') c = (c - 1 + len) % len;
+      else if (e.key === 'ArrowDown') c = (c + COLS) % len;
+      else if (e.key === 'ArrowUp') c = (c - COLS + len) % len;
+      if (c !== this.menu.val) { this.menu.val = c; this.menu.picked = true; this.renderMenu(); }
+      return;
+    }
+    if (this.menu.kind === 'puzzle') {
+      e.preventDefault(); e.stopPropagation();
+      switch (e.key) {
+        case 'Escape': this.closeMenu(); break;
+        case 'ArrowRight': this.puzzleKeyMove('Right'); break;
+        case 'ArrowLeft': this.puzzleKeyMove('Left'); break;
+        case 'ArrowUp': this.puzzleKeyMove('Up'); break;
+        case 'ArrowDown': this.puzzleKeyMove('Down'); break;
+      }
+      return;
+    }
+    if (this.menu.kind === 'tetris') {
+      e.preventDefault(); e.stopPropagation();
+      switch (e.key) {
+        case 'Escape': this.closeMenu(); break;
+        case 'ArrowLeft': this.tetrisMove(-1, 0); break;
+        case 'ArrowRight': this.tetrisMove(1, 0); break;
+        case 'ArrowUp': this.tetrisRotate(); break;
+        case 'ArrowDown': this.tetrisMove(0, 1); break;
+        case ' ': this.tetrisHardDrop(); break;
+      }
+      return;
+    }
+    if (this.menu.kind === 'config') {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === 'Escape') { this.closeMenu(); return; }
+      if (e.key === 'Enter' || e.key === ' ') { this.openConfigScreensaver(); return; }
+      return;
+    }
+    if (this.menu.kind === 'config-screensaver') {
+      e.preventDefault(); e.stopPropagation();
+      const m = this.menu;
+      const SAVERS = ['starnight', 'lines', 'polygons', 'fireworks', 'worms', 'tiles'];
+      if (e.key === 'Escape') { this.openConfig(); return; }
+      if (e.key === 'Enter') { this.saveConfigScreensaver(); return; }
+      if (e.key === 'ArrowUp') {
+        const i = SAVERS.indexOf(m.name);
+        if (i > 0) { m.name = SAVERS[i - 1]; this.renderMenu(); }
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        const i = SAVERS.indexOf(m.name);
+        if (i < SAVERS.length - 1) { m.name = SAVERS[i + 1]; this.renderMenu(); }
+        return;
+      }
+      return;
+    }
     e.preventDefault(); e.stopPropagation();
     const items = this.currentItems();
     const move = (dir) => {
@@ -1517,7 +3240,23 @@ the bar at the bottom is clickable and always works.`);
     if (it && it.run) it.run();
   }
 
+  // Stop an open Tetris game: clear its interval timer and drop the three
+  // document-level touch listeners. Safe to call unconditionally (both closeMenu
+  // and onClose route through it, so closing the leaf mid-game never leaks).
+  teardownTetris() {
+    if (this.menu && this.menu.timer) { window.clearInterval(this.menu.timer); this.menu.timer = null; }
+    if (this.boundTetrisTouchStart) {
+      document.removeEventListener('touchstart', this.boundTetrisTouchStart);
+      document.removeEventListener('touchmove', this.boundTetrisTouchMove);
+      document.removeEventListener('touchend', this.boundTetrisTouchEnd);
+      this.boundTetrisTouchStart = null;
+      this.boundTetrisTouchMove = null;
+      this.boundTetrisTouchEnd = null;
+    }
+  }
+
   closeMenu() {
+    this.teardownTetris();
     this.popMenuScope();
     if (this.overlayEl) { this.overlayEl.remove(); this.overlayEl = null; }
     this.menu = null;
@@ -1615,35 +3354,21 @@ the bar at the bottom is clickable and always works.`);
     return true;
   }
 
-  async viewZipEntry(p, en) {
-    let buf;
-    try { buf = await this.fp.extractZipEntry(p.zip.path, en.zipEntry); }
-    catch (e) { new Notice('Could not read entry: ' + e.message); return; }
-    if (IMAGE_RE.test(en.name)) {
-      if (buf.length > this.imageLimit()) { new Notice(`Image too large for preview (max ${fmtSize(this.imageLimit())}).`); return; }
-      const data = await bytesToDataURL(buf, mimeFor(en.name));
-      new ViewerModal(this.app, { title: `View — ${en.name}`, image: data }).open();
-      return;
-    }
-    if (buf.length > this.viewLimit()) { new Notice(`File too large for the viewer (max ${fmtSize(this.viewLimit())}).`); return; }
-    const content = new TextDecoder().decode(buf);
-    if (/\.(md|markdown)$/i.test(en.name)) {
-      new ViewerModal(this.app, { title: `Preview — ${en.name}`, markdown: content, sourcePath: '', component: this }).open();
-      return;
-    }
-    new ViewerModal(this.app, { title: `View — ${en.name}`, content, wrap: this.plugin.settings.wrapText }).open();
-  }
-
   zipDirSize(zip, base) {
     let total = 0;
     for (const ze of zip.entries) if (ze.name.startsWith(base) && !ze.name.endsWith('/')) total += ze.uncompSize;
     return total;
   }
 
-  async computeDirSize(p, en) {
+  async computeDirSize(p, en, shouldCancel) {
     if (en.dirSize != null) return;
-    if (p.zip) en.dirSize = this.zipDirSize(p.zip, p.zip.prefix + en.name + '/');
-    else { try { en.dirSize = await this.fp.dirSize(this.P.join(p.cwd, en.name)); } catch (_) { en.dirSize = 0; } }
+    if (p.zip) { en.dirSize = this.zipDirSize(p.zip, p.zip.prefix + en.name + '/'); return; }
+    try {
+      const size = await this.fp.dirSize(this.P.join(p.cwd, en.name), shouldCancel);
+      // a cancelled walk returns a partial total — don't cache it as the real size
+      if (shouldCancel && shouldCancel()) return;
+      en.dirSize = size;
+    } catch (_) { en.dirSize = 0; }
   }
 
   // extract the current selection (files / folders) out to a real directory
@@ -1932,8 +3657,11 @@ the bar at the bottom is clickable and always works.`);
   }
 
   renderInfoPanel(p) {
-    p.headEl.setText('Info');
+    p.headEl.empty();
+    p.headEl.createDiv({ cls: 'nc-panel-path', text: 'Info', attr: { style: 'direction: ltr;' } });
     p.listEl.empty();
+    // drop any dir-size walk still pending from a previous (superseded) render
+    if (this._infoSizeTimer) { window.clearTimeout(this._infoSizeTimer); this._infoSizeTimer = null; }
     const seq = ++p.renderSeq;
     const wrap = p.listEl.createDiv({ cls: 'nc-info' });
     const src = this.otherOf(p);
@@ -1978,10 +3706,19 @@ the bar at the bottom is clickable and always works.`);
       // for folders, show the recursive content size (compute once, cache on the entry)
       if (cur.isDir) {
         if (cur.dirSize != null) szLine.setText(`${fmtSize(cur.dirSize)} bytes${dateSuffix}`);
-        else this.computeDirSize(src, cur).then(() => {
-          if (seq !== p.renderSeq) return;
-          szLine.setText(`${fmtSize(cur.dirSize)} bytes${dateSuffix}`);
-        }).catch(() => {});
+        else {
+          // Defer the (potentially huge) recursive walk until the cursor settles,
+          // and cancel it the moment this render is superseded — so scrolling
+          // through a folder of big subfolders never piles up blocking walks.
+          szLine.setText('calculating…' + dateSuffix);
+          this._infoSizeTimer = window.setTimeout(() => {
+            this._infoSizeTimer = null;
+            this.computeDirSize(src, cur, () => seq !== p.renderSeq).then(() => {
+              if (seq !== p.renderSeq) return;
+              szLine.setText(cur.dirSize != null ? `${fmtSize(cur.dirSize)} bytes${dateSuffix}` : `‹DIR›${dateSuffix}`);
+            }).catch(() => {});
+          }, 300);
+        }
       }
     }
 
@@ -1998,7 +3735,8 @@ the bar at the bottom is clickable and always works.`);
   /* ── Quick view ── */
 
   renderQuickPanel(p) {
-    p.headEl.setText('Quick view');
+    p.headEl.empty();
+    p.headEl.createDiv({ cls: 'nc-panel-path', text: 'Quick view', attr: { style: 'direction: ltr;' } });
     p.listEl.empty();
     const seq = ++p.renderSeq;
     const src = this.otherOf(p);
@@ -2137,7 +3875,8 @@ the bar at the bottom is clickable and always works.`);
   }
 
   renderTreePanel(p) {
-    p.headEl.setText('Tree');
+    p.headEl.empty();
+    p.headEl.createDiv({ cls: 'nc-panel-path', text: 'Tree', attr: { style: 'direction: ltr;' } });
     p.listEl.empty();
     if (!p.tree) { this.initTree(p).then(() => this.renderTreePanel(p)); return; }
     p.tree.flat.forEach((it, i) => {
@@ -2244,6 +3983,63 @@ the bar at the bottom is clickable and always works.`);
 
 /* ── modals ──────────────────────────────────────────────── */
 
+// NC-style copy dialog. A single file shows an EDITABLE name field (rename
+// before copying); multiple files show the destination path read-only.
+// opts: { count, destDir, name (single only), onConfirm(renameTo|null) }
+class CopyModal extends Modal {
+  constructor(app, opts) { super(app); this.opts = opts; this.submitted = false; }
+  onOpen() {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass('nc-modal');
+    contentEl.createEl('h3', { text: 'Copy', cls: 'nc-modal-title' });
+    const single = this.opts.count === 1;
+    const dest = this.opts.destDir || '';
+    const displayDest = dest.length > 55 ? '...' + dest.slice(-52) : dest;
+    contentEl.createEl('div', {
+      text: single ? `Copy file to ${displayDest}` : `Copy ${this.opts.count} files to`,
+      cls: 'nc-modal-body',
+      attr: { style: 'white-space: nowrap;' }
+    });
+    const input = contentEl.createEl('input', { cls: 'nc-modal-input', attr: { type: 'text', spellcheck: 'false' } });
+    const errEl = contentEl.createDiv({ cls: 'nc-modal-error' });
+    const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
+    const ok = row.createEl('button', { text: 'Copy', cls: 'nc-btn nc-btn-default' });
+    const cancel = row.createEl('button', { text: 'Cancel', cls: 'nc-btn' });
+
+    const submit = () => {
+      if (single) {
+        const v = input.value.trim();
+        const err = invalidNameReason(v);
+        if (err) { errEl.setText(err); return; }
+        this.submitted = true; this.close(); this.opts.onConfirm(v);
+      } else {
+        this.submitted = true; this.close(); this.opts.onConfirm(null);
+      }
+    };
+    ok.addEventListener('click', submit);
+    cancel.addEventListener('click', () => this.close());
+    input.addEventListener('input', () => errEl.setText(''));
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+
+    if (single) {
+      // editable file name, pre-filled with the original; select the basename
+      // (without extension) so a quick retype renames but keeps the suffix
+      input.value = this.opts.name || '';
+      window.setTimeout(() => {
+        input.focus();
+        const dot = input.value.lastIndexOf('.');
+        if (dot > 0) input.setSelectionRange(0, dot); else input.select();
+      }, 0);
+    } else {
+      // read-only destination path; focus the Copy button so Enter just confirms
+      input.value = this.opts.destDir || '';
+      input.readOnly = true;
+      window.setTimeout(() => ok.focus(), 0);
+    }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 class ConfirmModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; }
   onOpen() {
@@ -2251,14 +4047,33 @@ class ConfirmModal extends Modal {
     modalEl.addClass('nc-modal');
     if (this.opts.danger) modalEl.addClass('nc-modal-danger');
     contentEl.createEl('h3', { text: this.opts.title, cls: 'nc-modal-title' });
-    contentEl.createEl('pre', { text: this.opts.body, cls: 'nc-modal-body' });
+    contentEl.createEl(this.opts.nowrap ? 'div' : 'pre', { 
+      text: this.opts.body, 
+      cls: 'nc-modal-body',
+      ...(this.opts.nowrap ? { attr: { style: 'white-space: nowrap;' } } : {})
+    });
     const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
-    const yes = row.createEl('button', { text: 'OK', cls: 'nc-btn nc-btn-default' });
-    const no = row.createEl('button', { text: 'Cancel', cls: 'nc-btn' });
+    const yes = row.createEl('button', { text: this.opts.confirmLabel || 'OK', cls: 'nc-btn nc-btn-default' });
+    // optional middle action (e.g. "Don't Save" in the unsaved-changes prompt)
+    let extra = null;
+    if (this.opts.extraLabel) {
+      extra = row.createEl('button', { text: this.opts.extraLabel, cls: 'nc-btn' });
+      extra.addEventListener('click', () => { this.close(); this.opts.onExtra && this.opts.onExtra(); });
+    }
+    const no = row.createEl('button', { text: this.opts.cancelLabel || 'Cancel', cls: 'nc-btn' });
     yes.addEventListener('click', () => { this.close(); this.opts.onConfirm && this.opts.onConfirm(); });
     no.addEventListener('click', () => this.close());
     window.setTimeout(() => yes.focus(), 0);
-    this.scope.register([], 'Enter', () => { this.close(); this.opts.onConfirm && this.opts.onConfirm(); return false; });
+    // Enter fires the *focused* button — matching Space's native behaviour — so
+    // tabbing to Cancel and pressing Enter cancels instead of confirming. With
+    // focus on the default button or the body, Enter still confirms.
+    this.scope.register([], 'Enter', () => {
+      const a = document.activeElement;
+      if (a === no) { this.close(); }
+      else if (extra && a === extra) { this.close(); this.opts.onExtra && this.opts.onExtra(); }
+      else { this.close(); this.opts.onConfirm && this.opts.onConfirm(); }
+      return false;
+    });
   }
   onClose() { this.contentEl.empty(); }
 }
@@ -2286,7 +4101,13 @@ class PromptModal extends Modal {
     cancel.addEventListener('click', () => this.close());
     input.addEventListener('input', () => errEl.setText(''));
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-    window.setTimeout(() => { input.focus(); input.select(); }, 0);
+    window.setTimeout(() => {
+      input.focus();
+      // selectBasename: highlight only the name, leaving the extension intact
+      // so a rename doesn't accidentally drop ".md" etc.
+      const dot = this.opts.selectBasename ? input.value.lastIndexOf('.') : -1;
+      if (dot > 0) input.setSelectionRange(0, dot); else input.select();
+    }, 0);
   }
   // resolve callers (e.g. the conflict "Rename" prompt) even when cancelled
   onClose() { this.contentEl.empty(); if (!this.submitted && this.opts.onSubmit) this.opts.onSubmit(null); }
@@ -2349,14 +4170,83 @@ class EggModal extends Modal {
 }
 
 class ViewerModal extends Modal {
-  constructor(app, opts) { super(app); this.opts = opts; }
+  constructor(app, opts) { super(app); this.opts = opts; this._navFocus = null; this._navBusy = false; }
   onOpen() {
-    const { contentEl, modalEl } = this;
+    const { modalEl } = this;
     modalEl.addClass('nc-modal'); modalEl.addClass('nc-viewer');
-    contentEl.createEl('h3', { text: this.opts.title, cls: 'nc-modal-title' });
+    // a paged viewer (Prev/Next/Close) gets its own button colouring: the
+    // focused (“selected”) button is green, the others sit black.
+    if (this.opts.nav) modalEl.addClass('nc-viewer-paged');
+    this.render();
+  }
 
-    // image preview
-    if (this.opts.image) {
+  // (Re)build the whole body for the current opts. Called again by Prev/Next
+  // so navigation can swap the file in place while the modal stays open.
+  render() {
+    const { contentEl } = this;
+    // tear down the previous page's per-modal renderers before clearing
+    if (this._mdComp) { this._mdComp.unload(); this._mdComp = null; }
+    if (this._vvFit && window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', this._vvFit);
+      window.visualViewport.removeEventListener('scroll', this._vvFit);
+      this._vvFit = null;
+    }
+    contentEl.empty();
+    this._titleEl = contentEl.createEl('h3', { text: this.opts.title, cls: 'nc-modal-title' });
+    if (this.opts.image) return this.renderImage();
+    if (this.opts.markdown != null) return this.renderMarkdown();
+    if (this.opts.editable) return this.renderEditable();
+    return this.renderText();
+  }
+
+  // Build the button row. A paged viewer (opts.nav) shows Prev/Next/Close and
+  // restores focus to the last-pressed nav button after a re-render so Space
+  // keeps paging; on first open `bodyEl` is focused so PgUp/PgDn/arrows scroll.
+  buildButtons(bodyEl) {
+    const row = this.contentEl.createDiv({ cls: 'nc-modal-buttons' });
+    if (this.opts.nav) {
+      const prev = row.createEl('button', { text: 'Prev', cls: 'nc-btn' });
+      const next = row.createEl('button', { text: 'Next', cls: 'nc-btn' });
+      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn' });
+      prev.addEventListener('click', () => this.navigate(-1, 'prev', prev));
+      next.addEventListener('click', () => this.navigate(1, 'next', next));
+      close.addEventListener('click', () => this.close());
+      window.setTimeout(() => {
+        if (this._navFocus === 'prev') prev.focus();
+        else if (this._navFocus === 'next') next.focus();
+        else if (bodyEl && bodyEl.focus) bodyEl.focus();
+        else next.focus();
+      }, 0);
+    } else {
+      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
+      close.addEventListener('click', () => this.close());
+      window.setTimeout(() => { if (bodyEl && bodyEl.focus) bodyEl.focus(); else close.focus(); }, 0);
+    }
+    return row;
+  }
+
+  // Step to the previous/next viewable file (opts.nav skips unviewable ones).
+  // If there is none in that direction we stay put and keep the button focused.
+  async navigate(dir, which, btn) {
+    if (this._navBusy || !this.opts.nav) return;
+    this._navBusy = true;
+    this._navFocus = which;
+    let o = null;
+    try { o = await this.opts.nav(dir); } catch (_) { o = null; }
+    this._navBusy = false;
+    if (!o) {
+      new Notice(dir < 0 ? 'No previous file.' : 'No more files.');
+      if (btn) btn.focus();
+      return;
+    }
+    o.nav = this.opts.nav;   // carry the pager across to the next page
+    this.opts = o;
+    this.render();
+  }
+
+  renderImage() {
+    const { contentEl } = this;
+    {
       const wrap = contentEl.createDiv({ cls: 'nc-viewer-img' });
       const img = wrap.createEl('img');
       img.src = this.opts.image;
@@ -2399,15 +4289,13 @@ class ViewerModal extends Modal {
         navigator.clipboard.writeText(v).then(() => new Notice('Copied ' + v), () => new Notice('Clipboard unavailable.'));
       });
 
-      const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
-      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
-      close.addEventListener('click', () => this.close());
-      window.setTimeout(() => close.focus(), 0);
-      return;
+      this.buildButtons(null);   // image isn't focusable → focus a button
     }
+  }
 
-    // rendered markdown preview
-    if (this.opts.markdown != null) {
+  renderMarkdown() {
+    const { contentEl } = this;
+    {
       const div = contentEl.createDiv({ cls: 'nc-viewer-md markdown-rendered' });
       div.tabIndex = 0;
       const src = this.opts.sourcePath || '';
@@ -2419,22 +4307,31 @@ class ViewerModal extends Modal {
       if (MarkdownRenderer && MarkdownRenderer.render) MarkdownRenderer.render(this.app, this.opts.markdown, div, src, comp);
       else if (MarkdownRenderer && MarkdownRenderer.renderMarkdown) MarkdownRenderer.renderMarkdown(this.opts.markdown, div, src, comp);
       else div.setText(this.opts.markdown);
-      const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
-      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
-      close.addEventListener('click', () => this.close());
-      window.setTimeout(() => div.focus(), 0);   // autofocus so PgUp/PgDn/arrows scroll
-      return;
+      this.buildButtons(div);   // autofocus the body so PgUp/PgDn/arrows scroll
     }
+  }
 
-    if (this.opts.editable) {
+  renderEditable() {
+    const { contentEl, modalEl } = this;
+    {
       const ta = contentEl.createEl('textarea', { cls: 'nc-viewer-area' });
+      this._ta = ta;
       ta.toggleClass('nc-wrap', !!this.opts.wrap);
       ta.setAttribute('wrap', this.opts.wrap ? 'soft' : 'off');   // native textarea wrapping
       ta.value = this.opts.content;
+      // track unsaved edits: a "*" prefix on the title flags a dirty buffer, and
+      // close() (below) asks before dropping unsaved changes. Compare against the
+      // original so undoing back to it clears the flag again.
+      this._dirty = false;
+      const original = this.opts.content;
+      ta.addEventListener('input', () => {
+        const d = ta.value !== original;
+        if (d !== this._dirty) { this._dirty = d; if (this._titleEl) this._titleEl.setText((d ? '* ' : '') + this.opts.title); }
+      });
       const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
       const save = row.createEl('button', { text: 'Save', cls: 'nc-btn nc-btn-default' });
       const close = row.createEl('button', { text: 'Close', cls: 'nc-btn' });
-      save.addEventListener('click', () => { this.opts.onSave && this.opts.onSave(ta.value); this.close(); });
+      save.addEventListener('click', () => { this.opts.onSave && this.opts.onSave(ta.value); this._dirty = false; this.close(); });
       close.addEventListener('click', () => this.close());
       window.setTimeout(() => ta.focus(), 0);
       // Mobile: keep the editor above the on-screen keyboard. The keyboard shrinks
@@ -2470,16 +4367,40 @@ class ViewerModal extends Modal {
         // when the keyboard animates in on focus, re-fit after it settles
         ta.addEventListener('focus', () => window.setTimeout(fit, 150));
       }
-    } else {
-      const pre = contentEl.createEl('pre', { text: this.opts.content, cls: 'nc-viewer-pre' });
-      pre.toggleClass('nc-wrap', !!this.opts.wrap);
-      pre.tabIndex = 0;
-      const row = contentEl.createDiv({ cls: 'nc-modal-buttons' });
-      const close = row.createEl('button', { text: 'Close', cls: 'nc-btn nc-btn-default' });
-      close.addEventListener('click', () => this.close());
-      window.setTimeout(() => pre.focus(), 0);   // autofocus so PgUp/PgDn/arrows scroll
     }
   }
+
+  renderText() {
+    const { contentEl } = this;
+    const pre = contentEl.createEl('pre', { text: this.opts.content, cls: 'nc-viewer-pre' });
+    pre.toggleClass('nc-wrap', !!this.opts.wrap);
+    pre.tabIndex = 0;
+    this.buildButtons(pre);   // autofocus the body so PgUp/PgDn/arrows scroll
+  }
+
+  // Guard the editor against losing unsaved edits. Every close path (Close
+  // button, Escape, clicking the backdrop) routes through here; when the buffer
+  // is dirty we hold the modal open and ask first. The confirm callbacks clear
+  // _dirty before re-calling close(), so the second pass falls straight through.
+  close() {
+    if (this.opts && this.opts.editable && this._dirty) { this.promptUnsaved(); return; }
+    super.close();
+  }
+
+  promptUnsaved() {
+    const ta = this._ta;
+    new ConfirmModal(this.app, {
+      title: 'Unsaved changes',
+      body: 'This file has unsaved changes.\nSave before closing?',
+      nowrap: true,
+      confirmLabel: 'Save',
+      extraLabel: "Don't Save",
+      cancelLabel: 'Cancel',
+      onConfirm: () => { if (this.opts.onSave) this.opts.onSave(ta ? ta.value : this.opts.content); this._dirty = false; this.close(); },
+      onExtra: () => { this._dirty = false; this.close(); },
+    }).open();
+  }
+
   onClose() {
     if (this._vvFit && window.visualViewport) {
       window.visualViewport.removeEventListener('resize', this._vvFit);

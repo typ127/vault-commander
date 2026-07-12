@@ -82,15 +82,26 @@ body.is-mobile .nc-root {
 .nc-panel.nc-active { border-color: var(--nc-cyan-bright); }
 
 .nc-panel-head {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   color: var(--nc-cyan-bright);
   background: var(--nc-blue);
   padding: 0 6px;
+}
+.nc-panel-path {
+  flex: 1;
+  text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl;            /* truncate the long left part of the path */
-  cursor: pointer;           /* clicking the header opens the bookmarks dialog */
+  direction: rtl; /* truncate the long left part of the path */
+}
+.nc-panel-star {
+  flex-shrink: 0;
+  cursor: pointer;
+  padding-left: 10px;
+  color: var(--nc-yellow, gold);
 }
 .nc-panel-head:hover { color: var(--nc-white); }
 .nc-panel.nc-active .nc-panel-head {
@@ -100,7 +111,7 @@ body.is-mobile .nc-root {
 
 .nc-colhead {
   display: flex;
-  color: var(--nc-cyan-bright);
+  color: var(--nc-yellow);
   border-bottom: 1px solid var(--nc-cyan);
   padding: 0 6px;
   white-space: nowrap;
@@ -174,7 +185,7 @@ body.is-mobile .nc-root {
   display: flex;
   align-items: center;
   padding: 0 6px;
-  background: var(--nc-blue);
+  background: var(--nc-black);
   color: var(--nc-white);
   overflow: hidden;            /* never produce a horizontal scrollbar */
 }
@@ -207,7 +218,7 @@ body.is-mobile .nc-root {
   display: flex;
   gap: 1px;
   padding: 2px 4px 4px;
-  background: var(--nc-blue);
+  background: var(--nc-black);
 }
 .nc-fkey {
   flex: 1 1 0;
@@ -281,16 +292,23 @@ body.is-mobile .nc-root {
   font-family: inherit;
 }
 
-.nc-modal-input {
+.modal.nc-modal .nc-modal-input {
   width: 100%;
-  background: #000080;
-  border: 1px solid #54fefe;
-  border-radius: 0;
-  color: #fefe54;
+  background: #00a8a8 !important;
+  border: none !important;
+  border-radius: 0 !important;
+  color: #000 !important;
   font-family: inherit;
   font-size: 1em;
-  padding: 2px 6px;
+  padding: 4px 6px;
   margin-bottom: 1em;
+  outline: none !important;
+  box-shadow: none !important;
+}
+/* read-only path field (e.g. multi-file copy): looks present but not editable */
+.modal.nc-modal .nc-modal-input[readonly] {
+  color: rgba(0, 0, 0, 0.6) !important;
+  cursor: default;
 }
 /* inline validation message in prompt dialogs (empty unless there's an error) */
 .nc-modal-error:not(:empty) {
@@ -304,30 +322,59 @@ body.is-mobile .nc-root {
   justify-content: center;
 }
 .nc-modal-buttons-wrap { flex-wrap: wrap; }
-/* classic Turbo Vision / NC dialog buttons: a green face with a hard
-   drop-shadow; the default button carries the « OK » selection markers */
-.nc-btn {
-  background: #00a800;
-  color: #000;
-  border: none;
-  border-radius: 0;
+/* classic Turbo Pascal dialog buttons: white face unfocused, green when focused */
+.modal.nc-modal .nc-btn {
+  background: #fff !important;
+  color: #888 !important;
+  border: none !important;
+  border-radius: 0 !important;
   font-family: inherit;
   font-size: 1em;
+  font-weight: bold;
   line-height: 1.25;
-  padding: 0 2ch;
+  padding: 0.25em 2ch;
+  margin: 0 1ch 0.5em 0;
   cursor: pointer;
-  outline: none;
-  box-shadow: 3px 2px 0 0 rgba(0, 0, 0, 0.5);
+  outline: none !important;
+  box-shadow: 1ch 0.5em 0 0 #000 !important;
+  transition: none !important;
 }
-.nc-btn:hover,
-.nc-btn:focus { background: #2adc2a; color: #000; }
-.nc-btn:active { box-shadow: 1px 1px 0 0 rgba(0, 0, 0, 0.5); transform: translate(2px, 1px); }
-
-/* the default button is drawn like NC's “‹ OK ›” */
-.nc-btn-default::before { content: '‹\00a0'; }
-.nc-btn-default::after  { content: '\00a0›'; }
+.modal.nc-modal .nc-btn:hover,
+.modal.nc-modal .nc-btn:focus { 
+  background: #00a800 !important; 
+  color: #fff !important; 
+}
+.modal.nc-modal .nc-btn:active { 
+  box-shadow: 0.5ch 0.25em 0 0 #000 !important; 
+  transform: translate(0.5ch, 0.25em) !important; 
+}
 
 .nc-viewer { width: min(900px, 90vw); }
+
+/* The viewer is a flex column bounded by the modal's max-height, so the box
+   itself never scrolls — only the body (pre / md / textarea) scrolls, and only
+   vertically. box-sizing keeps width:100% + padding inside the box (no stray
+   horizontal scrollbar; modals don't inherit a global border-box). */
+.nc-viewer.modal { display: flex; flex-direction: column; overflow: hidden; }
+.nc-viewer .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.nc-viewer .nc-modal-title,
+.nc-viewer .nc-modal-buttons { flex: 0 0 auto; }
+.nc-viewer-pre,
+.nc-viewer-area,
+.nc-viewer-md { flex: 1 1 auto; min-height: 0; }
+.nc-viewer-img { flex: 0 1 auto; min-height: 0; }
+.nc-viewer-pre,
+.nc-viewer-area,
+.nc-viewer-md,
+.nc-viewer-img { box-sizing: border-box; }
+
 .nc-viewer-pre,
 .nc-viewer-area {
   width: 100%;
@@ -345,8 +392,7 @@ body.is-mobile .nc-root {
   resize: none;
   outline: none;
 }
-.nc-viewer-pre:focus,
-.nc-viewer-md:focus { box-shadow: inset 0 0 0 1px #aaffff; }
+.nc-viewer-pre:focus { box-shadow: inset 0 0 0 1px #aaffff; }
 
 /* mobile text editor: sized to the visual viewport (set via JS) so it sits above
    the on-screen keyboard; the textarea fills the space, buttons stay pinned */
@@ -410,26 +456,166 @@ body.is-mobile .nc-root {
 .nc-color-swatch { width: 14px; height: 14px; border: 1px solid #fff; }
 .nc-color-hex { white-space: nowrap; }
 
-/* rendered markdown preview */
+/* rendered markdown preview (F3) — the original blue DOS viewer palette (white
+   text on #000080, light-cyan links, cyan code), now with Prism syntax
+   highlighting in fenced blocks (grey / white / yellow / cyan).
+   NOTE: colours are hard-coded, NOT var(--nc-*) — modals render outside
+   .nc-content, where those custom properties don't resolve (see the modal
+   section above). Scoped to the viewer. */
 .nc-viewer-md {
   width: 100%;
   max-height: min(65vh, 640px);
   overflow: auto;
   background: #000080;
-  color: #fff;
+  color: #ffffff;
   border: 1px solid #54fefe;
-  padding: 10px 16px;
+  padding: 12px 18px;
   margin: 0 0 1em;
   outline: none;
+  text-align: left;
   font-family: var(--font-text, sans-serif);
-  white-space: normal;
+  font-size: 14px;
+  line-height: 1.5;
+  word-wrap: break-word;
 }
-.nc-viewer-md a { color: #aaffff; }
-.nc-viewer-md code, .nc-viewer-md pre {
+.nc-viewer-md:focus { box-shadow: inset 0 0 0 1px #aaffff; }
+
+/* block spacing */
+.nc-viewer-md p,
+.nc-viewer-md blockquote,
+.nc-viewer-md ul,
+.nc-viewer-md ol,
+.nc-viewer-md dl,
+.nc-viewer-md table,
+.nc-viewer-md pre { margin: 0 0 16px; }
+.nc-viewer-md > :first-child { margin-top: 0; }
+.nc-viewer-md > :last-child { margin-bottom: 0; }
+
+/* headings — alternating cyan / yellow by level (odd = cyan, even = yellow),
+   with a hairline rule under the top two */
+.nc-viewer-md h1,
+.nc-viewer-md h2,
+.nc-viewer-md h3,
+.nc-viewer-md h4,
+.nc-viewer-md h5,
+.nc-viewer-md h6 {
+  margin: 24px 0 16px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.nc-viewer-md h1,
+.nc-viewer-md h3,
+.nc-viewer-md h5 { color: #54fefe; }   /* cyan */
+.nc-viewer-md h2,
+.nc-viewer-md h4,
+.nc-viewer-md h6 { color: #fefe54; }   /* yellow */
+.nc-viewer-md h1 { font-size: 2em; padding-bottom: .3em; border-bottom: 1px solid #00a8a8; }
+.nc-viewer-md h2 { font-size: 1.5em; padding-bottom: .3em; border-bottom: 1px solid #00a8a8; }
+.nc-viewer-md h3 { font-size: 1.25em; }
+.nc-viewer-md h4 { font-size: 1em; }
+.nc-viewer-md h5 { font-size: .875em; }
+.nc-viewer-md h6 { font-size: .85em; }
+
+/* lists */
+.nc-viewer-md ul,
+.nc-viewer-md ol { padding-left: 2em; }
+.nc-viewer-md li + li { margin-top: .25em; }
+
+/* links & inline emphasis */
+.nc-viewer-md a { color: #aaffff; text-decoration: none; }
+.nc-viewer-md a:hover { text-decoration: underline; }
+.nc-viewer-md strong { font-weight: 700; color: #ffffff; }
+.nc-viewer-md em { font-style: italic; }
+
+/* code: inline pill + fenced block (dark-blue field) */
+.nc-viewer-md code,
+.nc-viewer-md pre {
+  font-family: "Px437 IBM VGA8", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.nc-viewer-md code {
+  padding: .15em .4em;
+  font-size: 90%;
   background: #00005a;
+  border-radius: 0;
   color: #54fefe;
-  font-family: "Px437 IBM VGA8", "Consolas", "Menlo", monospace;
 }
+.nc-viewer-md pre {
+  padding: 12px 14px;
+  overflow: auto;
+  font-size: 90%;
+  line-height: 1.45;
+  background: #00005a;
+  border: 1px solid #00a8a8;
+  border-radius: 0;
+  color: #ffffff;
+}
+.nc-viewer-md pre code {
+  padding: 0;
+  font-size: 100%;
+  background: transparent;
+  color: inherit;
+  white-space: pre;
+}
+
+/* Prism syntax tokens — hard-coded four-colour DOS palette. Works in Obsidian
+   (built-in Prism) and in the standalone (Prism added to the shim). */
+.nc-viewer-md .token.comment,
+.nc-viewer-md .token.prolog,
+.nc-viewer-md .token.doctype,
+.nc-viewer-md .token.cdata { color: #8b8ba6; font-style: italic; }
+.nc-viewer-md .token.punctuation,
+.nc-viewer-md .token.operator { color: #b8b8c8; }
+.nc-viewer-md .token.keyword,
+.nc-viewer-md .token.atrule,
+.nc-viewer-md .token.important,
+.nc-viewer-md .token.selector,
+.nc-viewer-md .token.tag,
+.nc-viewer-md .token.builtin,
+.nc-viewer-md .token.entity { color: #fefe54; }
+.nc-viewer-md .token.string,
+.nc-viewer-md .token.char,
+.nc-viewer-md .token.attr-value,
+.nc-viewer-md .token.regex,
+.nc-viewer-md .token.url,
+.nc-viewer-md .token.number,
+.nc-viewer-md .token.boolean,
+.nc-viewer-md .token.constant,
+.nc-viewer-md .token.symbol,
+.nc-viewer-md .token.inserted { color: #54fefe; }
+.nc-viewer-md .token.function,
+.nc-viewer-md .token.class-name,
+.nc-viewer-md .token.property,
+.nc-viewer-md .token.attr-name,
+.nc-viewer-md .token.variable { color: #ffffff; }
+.nc-viewer-md .token.deleted { color: #b8b8c8; text-decoration: line-through; }
+.nc-viewer-md .token.namespace { opacity: .7; }
+.nc-viewer-md .token.bold { font-weight: 700; }
+.nc-viewer-md .token.italic { font-style: italic; }
+
+/* blockquotes */
+.nc-viewer-md blockquote {
+  padding: 0 1em;
+  color: #b8b8c8;
+  border-left: .25em solid #00a8a8;
+}
+.nc-viewer-md blockquote > :first-child { margin-top: 0; }
+.nc-viewer-md blockquote > :last-child { margin-bottom: 0; }
+
+/* rule, images, tables */
+.nc-viewer-md hr {
+  height: 1px;
+  padding: 0;
+  margin: 24px 0;
+  background: #00a8a8;
+  border: 0;
+}
+.nc-viewer-md img { max-width: 100%; background: transparent; }
+.nc-viewer-md table { border-collapse: collapse; display: block; width: max-content; max-width: 100%; overflow: auto; }
+.nc-viewer-md th,
+.nc-viewer-md td { padding: 6px 13px; border: 1px solid #00a8a8; color: #ffffff; }
+.nc-viewer-md th { font-weight: 700; background: #00005a; color: #54fefe; }
+.nc-viewer-md tr { background: #000080; }
+.nc-viewer-md tr:nth-child(2n) { background: #000040; }
 
 .nc-drive-list { display: flex; flex-direction: column; gap: 1px; }
 .nc-drive-item {
@@ -457,11 +643,51 @@ body.is-mobile .nc-root {
 .nc-dropdown.nc-dropdown-docked { top: 0; }   /* flush under the docked bar — no gap */
 
 /* F9 top menu bar — cyan with black text, like NC */
+.nc-menubar .nc-btn-label {
+  display: inline;
+}
+
+/* Mobile responsive layout */
+@media (max-width: 600px) and (orientation: portrait) {
+  .nc-panel:not(.nc-active) {
+    display: none;
+  }
+  .nc-menubar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none; /* Hide scrollbar Firefox */
+  }
+  .nc-menubar::-webkit-scrollbar {
+    display: none; /* Hide scrollbar Chrome/Safari */
+  }
+  .nc-menu-btn {
+    flex: 0 0 auto;
+    padding: 0 12px;
+  }
+}
+
+/* Remove Obsidian's own view header overlay to clean up landscape mode */
+.workspace-leaf-content[data-type="vault-commander"] .view-header,
+.workspace-leaf-content[data-type="vault-commander"] .mobile-navbar {
+  display: none !important;
+}
+.workspace-leaf-content[data-type="vault-commander"] .view-content {
+  padding: 0 !important;
+  height: 100% !important;
+}
+
 .nc-menubar {
   display: flex;
   background: var(--nc-cyan);
   color: var(--nc-black);
   padding: 0 4px;
+}
+.nc-menu-clock {
+  margin-left: auto;
+  padding: 0 12px;
+  color: var(--nc-black);
+  white-space: nowrap;
 }
 .nc-menucat {
   padding: 0 12px;
@@ -469,8 +695,366 @@ body.is-mobile .nc-root {
   white-space: nowrap;
 }
 .nc-menucat.nc-sel {
-  background: var(--nc-cyan-bright);
-  color: var(--nc-black);
+  background: var(--nc-black);
+  color: var(--nc-white);
+}
+
+/* Calendar */
+.nc-calendar {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--nc-cyan);
+  border: 3px double #ffffff;
+  padding: 10px 16px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  font-family: inherit;
+  color: #fefe54;
+}
+.nc-calendar-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--nc-cyan);
+  padding: 0 8px;
+}
+.nc-calendar-hdr {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 12px 0;
+  gap: 12px;
+}
+.nc-cal-btn {
+  cursor: pointer;
+  padding: 0 4px;
+}
+.nc-cal-btn.nc-sel {
+  background: #000;
+  color: #fefe54;
+}
+.nc-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px 8px;
+  text-align: right;
+}
+.nc-cal-day.nc-today {
+  color: #000;
+  background: #54fe54;
+}
+
+/* Calculator */
+.nc-calculator {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #b4b4b4;
+  border: 3px double #000;
+  padding: 16px 20px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  font-family: inherit;
+}
+.nc-calculator-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #b4b4b4;
+  color: #000;
+  padding: 0 8px;
+}
+.nc-calc-disp {
+  background: #0000a8;
+  color: #fff;
+  text-align: right;
+  padding: 4px 8px;
+  margin-bottom: 16px;
+  min-height: 1.5em;
+  font-weight: bold;
+}
+.nc-calc-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.nc-calc-btn {
+  background: #00a800;
+  color: #000;
+  text-align: center;
+  padding: 4px 12px;
+  cursor: pointer;
+  box-shadow: 4px 4px 0 0 #000;
+  font-weight: bold;
+}
+.nc-calc-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 2px 2px 0 0 #000;
+}
+.nc-calc-btn.nc-sel {
+  background: #54fe54;
+}
+
+/* ASCII Chart */
+.nc-ascii {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #cccccc;
+  border: 3px double #ffffff;
+  padding: 10px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.nc-ascii-title {
+  position: absolute;
+  top: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #cccccc;
+  padding: 0 8px;
+  font-weight: bold;
+  color: #000;
+}
+.nc-ascii-grid {
+  display: grid;
+  grid-template-columns: repeat(32, auto);
+  gap: 0;
+  background: transparent;
+  padding: 0;
+  border: none;
+}
+.nc-ascii-cell {
+  width: 14px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #000;
+  cursor: pointer;
+  font-family: monospace;
+  font-size: 16px;
+}
+.nc-ascii-cell.nc-sel {
+  background: #000;
+  color: #cccccc;
+}
+.nc-ascii-info {
+  background: transparent;
+  color: #000;
+  text-align: left;
+  padding: 4px 0 0 0;
+  font-family: monospace;
+  font-size: 14px;
+  border: none;
+  border-top: 1px solid #000;
+}
+.nc-ascii-btnrow {
+  display: flex;
+  justify-content: center;
+  padding: 4px 1ch 0.5em 0;
+}
+/* Symbols chart reuses the ASCII dialog styling, but with a wider grid so
+   the (often wider) Unicode glyphs are not clipped. */
+.nc-symbols-grid {
+  grid-template-columns: repeat(16, auto);
+}
+.nc-symbols-grid .nc-ascii-cell {
+  width: 24px;
+  height: 24px;
+  font-size: 18px;
+}
+
+/* Puzzle */
+.nc-puzzle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #0000a8;
+  border: 3px double #ffffff;
+  padding: 16px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  font-family: inherit;
+  color: #fff;
+}
+.nc-puzzle-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0000a8;
+  color: #fff;
+  padding: 0 8px;
+}
+.nc-puzzle-layout {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}
+.nc-puzzle-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+  background: #0000a8;
+  border: 2px solid #b4b4b4;
+  padding: 2px;
+}
+.nc-puzzle-tile {
+  width: 32px;
+  height: 32px;
+  background: #b4b4b4;
+  color: #0000a8;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 2px 2px 0 0 #000;
+  user-select: none;
+}
+.nc-puzzle-tile:active:not(.empty) {
+  transform: translate(1px, 1px);
+  box-shadow: 1px 1px 0 0 #000;
+}
+.nc-puzzle-tile.empty {
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+}
+.nc-puzzle-sidebar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.nc-puzzle-moves {
+  margin-top: 8px;
+  font-size: 1.2em;
+}
+
+/* Tetris */
+.nc-tetris {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--nc-cyan);
+  border: 3px double #ffffff;
+  padding: 16px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  font-family: inherit;
+  color: #fff;
+}
+.nc-tetris-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--nc-cyan);
+  color: #fefe54;
+  padding: 0 8px;
+}
+.nc-tetris-layout {
+  display: flex;
+  gap: 20px;
+}
+.nc-tetris-board {
+  background: #000;
+  border: 2px solid #b4b4b4;
+  padding: 2px;
+  display: grid;
+  grid-template-rows: repeat(20, 16px);
+  grid-template-columns: repeat(10, 16px);
+  gap: 1px;
+}
+.nc-tetris-cell {
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+}
+.nc-tetris-cell.c0 { background: #000; }
+.nc-tetris-cell.c1 { background: #54fefe; }
+.nc-tetris-cell.c2 { background: #5454fe; }
+.nc-tetris-cell.c3 { background: #fea854; }
+.nc-tetris-cell.c4 { background: #fefe54; }
+.nc-tetris-cell.c5 { background: #54fe54; }
+.nc-tetris-cell.c6 { background: #fe54fe; }
+.nc-tetris-cell.c7 { background: #fe5454; }
+.nc-tetris-sidebar {
+  display: flex;
+  flex-direction: column;
+  color: #fefe54;
+}
+.nc-tetris-sidebar .label {
+  color: #fff;
+  margin-top: 10px;
+}
+.nc-tetris-preview {
+  margin-top: 5px;
+  display: grid;
+  grid-template-rows: repeat(2, 16px);
+  grid-template-columns: repeat(4, 16px);
+  background: #000;
+  border: 1px solid #b4b4b4;
+  padding: 2px;
+  gap: 1px;
+}
+.nc-tetris-over {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #fe5454;
+  color: #fff;
+  padding: 8px 16px;
+  border: 2px solid #fff;
+  font-weight: bold;
+  font-size: 1.2em;
+  box-shadow: 10px 10px 0 0 rgba(0, 0, 0, 0.55);
+}  padding: 10px 16px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+  font-family: inherit;
+  color: #fefe54;
+}
+.nc-calendar-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--nc-cyan);
+  padding: 0 8px;
+}
+.nc-calendar-hdr {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 12px 0;
+  gap: 12px;
+}
+.nc-cal-btn {
+  cursor: pointer;
+  padding: 0 4px;
+}
+.nc-cal-btn.nc-sel {
+  background: #000;
+  color: #fefe54;
+}
+.nc-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px 8px;
+  text-align: right;
+}
+.nc-cal-day.nc-today {
+  color: #000;
+  background: #54fe54;
 }
 
 /* dropdown body (F9) and centered box (F2): cyan box, black text,
@@ -499,8 +1083,8 @@ body.is-mobile .nc-root {
 }
 .nc-usermenu-title {
   text-align: center;
-  background: var(--nc-cyan-bright);
-  color: var(--nc-black);
+  background: #000;
+  color: #fff;
   margin-bottom: 1px;
 }
 .nc-menu-item {
@@ -683,7 +1267,7 @@ body.is-mobile .nc-root {
 .nc-content.nc-theme-gray .nc-menucat.nc-sel { background: #00a8a8; color: #000; }
 .nc-content.nc-theme-gray .nc-dropdown,
 .nc-content.nc-theme-gray .nc-usermenu { background: #b4b4b4; color: #000; border-color: #000; }
-.nc-content.nc-theme-gray .nc-usermenu-title { background: #00a8a8; color: #000; }
+.nc-content.nc-theme-gray .nc-usermenu-title { background: #000; color: #fff; }
 .nc-content.nc-theme-gray .nc-menu-item { color: #000; }
 .nc-content.nc-theme-gray .nc-menu-item.nc-sel { background: #00a8a8; color: #000; }
 .nc-content.nc-theme-gray .nc-menu-sep { border-top-color: rgba(0, 0, 0, 0.4); }
@@ -701,6 +1285,173 @@ body.is-mobile .nc-root {
 .nc-content.nc-theme-gray .nc-quick-dir,
 .nc-content.nc-theme-gray .nc-quick-dir div { color: #fff; }
 .nc-content.nc-theme-gray .nc-quick-msg { color: var(--nc-cyan-bright); }
+
+/* ============================================================
+   Configuration dialog
+   ============================================================ */
+.nc-config-dialog {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 540px;
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+  border: 3px double #ffffff;
+  padding: 18px 24px 14px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+}
+.nc-config-dialog.nc-config-inactive {
+  filter: brightness(0.72);
+  pointer-events: none;
+  transform: translate(calc(-50% - 24px), calc(-50% - 18px));
+}
+.nc-config-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--nc-cyan);
+  color: var(--nc-black);
+  padding: 0 10px;
+  white-space: nowrap;
+  font-weight: bold;
+}
+.nc-config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+.nc-config-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.nc-config-btn {
+  min-width: 16ch;
+  padding: 0.2em 1ch;
+  margin: 0 1ch 0.5em 0;
+  background: #fff;
+  color: #000;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  font-size: 1em;
+  font-weight: bold;
+  line-height: 1.25;
+  box-shadow: 1ch 0.5em 0 0 #000;
+  white-space: nowrap;
+}
+.nc-config-btn.nc-sel { background: var(--nc-yellow); }
+.nc-config-btn-disabled { color: #888; cursor: default; }
+.nc-config-btn-disabled.nc-config-btn { color: #888; }
+.nc-config-desc { color: var(--nc-black); white-space: nowrap; }
+.nc-config-dim  { color: rgba(0,0,0,0.4); }
+.nc-config-footer {
+  padding: 6px 0 4px;
+  border-top: 1px solid rgba(255,255,255,0.5);
+  margin-top: 4px;
+}
+.nc-config-btnrow {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 1ch 0.5em 0;
+}
+.nc-config-okbtn {
+  min-width: 6ch;
+  padding: 0.2em 2ch;
+  margin: 0 1ch 0 0;
+  background: #fff;
+  color: #888;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  text-align: center;
+  font-family: inherit;
+  font-size: 1em;
+  font-weight: bold;
+  line-height: 1.25;
+  box-shadow: 1ch 0.5em 0 0 #000;
+  outline: none;
+}
+.nc-config-okbtn:hover { background: #00a800; color: #fff; }
+.nc-config-okbtn:active { box-shadow: 0.5ch 0.25em 0 0 #000; transform: translate(0.5ch, 0.25em); }
+
+/* Screen Savers sub-dialog */
+.nc-config-ss-dialog {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(calc(-50% + 24px), calc(-50% + 18px));
+  min-width: 440px;
+  background: #b4b4b4;
+  color: #000;
+  border: 3px double #000;
+  padding: 18px 20px 14px;
+  box-shadow: 20px 15px 0 0 rgba(0, 0, 0, 0.55);
+}
+.nc-config-ss-title {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #b4b4b4;
+  color: #000;
+  padding: 0 10px;
+  white-space: nowrap;
+  font-weight: bold;
+}
+.nc-config-ss-frame {
+  border: 1px solid #707070;
+  padding: 8px 14px 10px;
+  margin-bottom: 10px;
+  position: relative;
+}
+.nc-config-ss-framelabel {
+  position: absolute;
+  top: -9px;
+  left: 10px;
+  background: #b4b4b4;
+  padding: 0 4px;
+  color: #fefe54;
+  font-weight: bold;
+}
+.nc-config-ss-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px 16px;
+  margin-top: 6px;
+}
+.nc-config-ss-row {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 1px 0;
+}
+.nc-config-radio { color: #fefe54; font-weight: bold; white-space: pre; }
+.nc-config-ss-label { color: #000; }
+.nc-config-ss-active { color: #fefe54; font-weight: bold; }
+.nc-config-ss-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.nc-config-ss-chkrow { display: flex; align-items: center; cursor: pointer; gap: 2px; }
+.nc-config-ss-delayval { min-width: 24px; text-align: center; display: inline-block; }
+.nc-config-ss-spin { color: #fefe54; cursor: pointer; font-weight: bold; }
+
+/* Screensaver canvas */
+.nc-screensaver {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  cursor: none;
+}
 
 /* ============================================================
    Secret screen (type "xyzzy" on the command line)
