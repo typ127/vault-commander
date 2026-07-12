@@ -1255,7 +1255,7 @@ the bar at the bottom is clickable and always works.`);
     if (mode === 'copy' && this.fp.writeClipboardFiles) this.fp.writeClipboardFiles(sel.map((f) => f.full));
     // remember the OS clipboard state now, so a later paste can tell whether
     // the user has since copied something else in Finder (which should win)
-    this.fileClip.osSig = (this.fp.clipboardFiles ? this.fp.clipboardFiles() : []).join(' ');
+    this.fileClip.osSig = (this.fp.clipboardFiles ? this.fp.clipboardFiles() : []).join('\x00');
     new Notice(`${mode === 'move' ? 'Cut' : 'Copied'} ${sel.length} item(s) to clipboard.`);
   }
 

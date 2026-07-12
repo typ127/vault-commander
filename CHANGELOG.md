@@ -4,6 +4,19 @@ All notable changes to **Vault Commander** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026-07-12
+
+Patch release — internal cleanups, no behavior change.
+
+### Fixed
+- **Malformed CSS.** Removed a duplicated Calendar style block whose lost
+  selector left an invalid rule (`} padding: …`) after `.nc-tetris-over`,
+  clearing an Obsidian lint warning. Calendar styling is unchanged.
+- **Removed a stray NUL byte in the source.** The OS-clipboard signature
+  separator was a literal null character; it is now the `\x00` escape
+  (identical at runtime), so the file is plain text again and no longer
+  reads as binary to editors and tooling.
+
 ## [1.1.0] — 2026-07-12
 
 First feature update since the initial release. Adds a file viewer with paging,
@@ -56,4 +69,5 @@ retro tools and games — plus a round of correctness fixes.
   and is cancelled as soon as you move on — so pointing the other panel at a huge
   directory tree no longer hangs the app.
 
+[1.1.1]: https://github.com/typ127/vault-commander/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/typ127/vault-commander/compare/1.0.0...1.1.0
