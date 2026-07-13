@@ -27,17 +27,22 @@
   overflow: hidden;
 }
 
-/* fullscreen: the NC leaf covers the workspace, sidebars and ribbon … */
-.workspace-leaf.nc-fs {
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 100 !important;
-}
-/* … but dialogs, menus and notices must still appear ON TOP of it */
-body.nc-fs-active .modal-container { z-index: 1000 !important; }
+/* fullscreen: the NC leaf covers the workspace, sidebars and ribbon.
+   The leaf's fixed positioning is applied — and re-asserted — as inline styles in
+   setFullscreen() / _applyFsLeaf() (see main.js). It must be the leaf itself:
+   Obsidian sets `contain: strict` on .workspace-leaf, so a fixed element inside
+   the view can only fill the leaf, never the window. Obsidian rewrites the leaf's
+   inline style on any re-layout (desktop tab switch, mobile orientation change),
+   so we re-assert on resize / orientationchange / workspace layout-change (and via
+   a MutationObserver) — keeping fullscreen stable without any stylesheet
+   important-flag. */
+/* … dialogs, menus and notices must still appear ON TOP of the fullscreen leaf.
+   They live at body level, so raising their z-index above the leaf's (100)
+   suffices; the body.nc-fs-active prefix outspecifies Obsidian's defaults. */
+body.nc-fs-active .modal-container { z-index: 1000; }
 body.nc-fs-active .menu,
 body.nc-fs-active .suggestion-container,
-body.nc-fs-active .notice-container { z-index: 1100 !important; }
+body.nc-fs-active .notice-container { z-index: 1100; }
 
 .nc-root {
   position: relative;
@@ -200,7 +205,9 @@ body.is-mobile .nc-root {
   color: var(--nc-white);
 }
 .nc-cmd-sep { flex: 0 0 auto; white-space: pre; color: var(--nc-white); }
-.nc-cmd-input {
+/* .nc-root prefix raises specificity so `box-shadow: none` beats Obsidian's
+   input focus ring via the cascade alone (no important-flag needed) */
+.nc-root .nc-cmd-input {
   flex: 1 1 auto;
   min-width: 0;                /* let the input shrink instead of overflowing */
   background: transparent;
@@ -210,7 +217,7 @@ body.is-mobile .nc-root {
   font-family: var(--nc-font);
   font-size: 15px;
   padding: 0;
-  box-shadow: none !important;
+  box-shadow: none;
 }
 
 /* ── function-key bar ── */
@@ -251,22 +258,26 @@ body.is-mobile .nc-root {
    Modals — classic gray Turbo Vision dialogs
    (rendered outside .nc-content, so colors are hard-coded here)
    ============================================================ */
-/* non-modal: drop Obsidian's dark dimmed backdrop behind our dialogs */
-.modal-container:has(.modal.nc-modal) {
-  background-color: transparent !important;
+/* drop Obsidian's dark dimmed backdrop behind our dialogs. The .nc-modal-parent
+   class is added to the modal container in each modal's onOpen() (see main.js),
+   which avoids the parent-selector pseudo-class and its broad-invalidation cost. */
+.modal-container.nc-modal-parent {
+  background-color: transparent;
 }
-.modal-container:has(.modal.nc-modal) .modal-bg {
-  background-color: transparent !important;
-  opacity: 0 !important;
+.modal-container.nc-modal-parent .modal-bg {
+  background-color: transparent;
+  opacity: 0;
 }
-.modal.nc-modal {
+/* .modal-container prefix raises specificity above Obsidian's own .modal rules
+   so these win through the cascade alone (no important-flag needed) */
+.modal-container .modal.nc-modal {
   background: #aaaaaa;
   border: 3px double #ffffff;
   border-radius: 0;
   color: #000;
   font-family: "Px437 IBM VGA8", "Consolas", "Menlo", "Courier New", monospace;
   /* hard, semi-transparent DOS drop-shadow: bottom-right, right ≈ 2× bottom */
-  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55) !important;   /* big hard DOS shadow, bottom-right */
+  box-shadow: 30px 25px 0 0 rgba(0, 0, 0, 0.55);   /* big hard DOS shadow, bottom-right */
 }
 /* hide Obsidian's round close button — doesn't fit the DOS theme; our modals
    provide their own Close / action buttons (or tap-outside / Esc still works) */
@@ -292,22 +303,22 @@ body.is-mobile .nc-root {
   font-family: inherit;
 }
 
-.modal.nc-modal .nc-modal-input {
+.modal-container .modal.nc-modal .nc-modal-input {
   width: 100%;
-  background: #00a8a8 !important;
-  border: none !important;
-  border-radius: 0 !important;
-  color: #000 !important;
+  background: #00a8a8;
+  border: none;
+  border-radius: 0;
+  color: #000;
   font-family: inherit;
   font-size: 1em;
   padding: 4px 6px;
   margin-bottom: 1em;
-  outline: none !important;
-  box-shadow: none !important;
+  outline: none;
+  box-shadow: none;
 }
 /* read-only path field (e.g. multi-file copy): looks present but not editable */
-.modal.nc-modal .nc-modal-input[readonly] {
-  color: rgba(0, 0, 0, 0.6) !important;
+.modal-container .modal.nc-modal .nc-modal-input[readonly] {
+  color: rgba(0, 0, 0, 0.6);
   cursor: default;
 }
 /* inline validation message in prompt dialogs (empty unless there's an error) */
@@ -323,11 +334,11 @@ body.is-mobile .nc-root {
 }
 .nc-modal-buttons-wrap { flex-wrap: wrap; }
 /* classic Turbo Pascal dialog buttons: white face unfocused, green when focused */
-.modal.nc-modal .nc-btn {
-  background: #fff !important;
-  color: #888 !important;
-  border: none !important;
-  border-radius: 0 !important;
+.modal-container .modal.nc-modal .nc-btn {
+  background: #fff;
+  color: #888;
+  border: none;
+  border-radius: 0;
   font-family: inherit;
   font-size: 1em;
   font-weight: bold;
@@ -335,18 +346,18 @@ body.is-mobile .nc-root {
   padding: 0.25em 2ch;
   margin: 0 1ch 0.5em 0;
   cursor: pointer;
-  outline: none !important;
-  box-shadow: 1ch 0.5em 0 0 #000 !important;
-  transition: none !important;
+  outline: none;
+  box-shadow: 1ch 0.5em 0 0 #000;
+  transition: none;
 }
-.modal.nc-modal .nc-btn:hover,
-.modal.nc-modal .nc-btn:focus { 
-  background: #00a800 !important; 
-  color: #fff !important; 
+.modal-container .modal.nc-modal .nc-btn:hover,
+.modal-container .modal.nc-modal .nc-btn:focus {
+  background: #00a800;
+  color: #fff;
 }
-.modal.nc-modal .nc-btn:active { 
-  box-shadow: 0.5ch 0.25em 0 0 #000 !important; 
-  transform: translate(0.5ch, 0.25em) !important; 
+.modal-container .modal.nc-modal .nc-btn:active {
+  box-shadow: 0.5ch 0.25em 0 0 #000;
+  transform: translate(0.5ch, 0.25em);
 }
 
 .nc-viewer { width: min(900px, 90vw); }
@@ -530,7 +541,7 @@ body.is-mobile .nc-root {
 /* code: inline pill + fenced block (dark-blue field) */
 .nc-viewer-md code,
 .nc-viewer-md pre {
-  font-family: "Px437 IBM VGA8", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "Px437 IBM VGA8", "SFMono-Regular", Menlo, Consolas, "Courier New", monospace;
 }
 .nc-viewer-md code {
   padding: .15em .4em;
@@ -656,7 +667,7 @@ body.is-mobile .nc-root {
     overflow-x: auto;
     flex-wrap: nowrap;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: none; /* Hide scrollbar Firefox */
+    /* scrollbar hidden via ::-webkit-scrollbar below (Obsidian runs on Chromium) */
   }
   .nc-menubar::-webkit-scrollbar {
     display: none; /* Hide scrollbar Chrome/Safari */
@@ -667,14 +678,16 @@ body.is-mobile .nc-root {
   }
 }
 
-/* Remove Obsidian's own view header overlay to clean up landscape mode */
+/* Remove Obsidian's own view header overlay to clean up landscape mode.
+   The [data-type] attribute selector already outspecifies Obsidian's own
+   .view-header / .view-content rules, so no important-flag is needed. */
 .workspace-leaf-content[data-type="vault-commander"] .view-header,
 .workspace-leaf-content[data-type="vault-commander"] .mobile-navbar {
-  display: none !important;
+  display: none;
 }
 .workspace-leaf-content[data-type="vault-commander"] .view-content {
-  padding: 0 !important;
-  height: 100% !important;
+  padding: 0;
+  height: 100%;
 }
 
 .nc-menubar {
@@ -1141,7 +1154,14 @@ body.is-mobile .nc-root {
 .nc-quick-img { padding: 6px; text-align: center; }
 .nc-quick-img img { max-width: 100%; height: auto; }
 
-/* ── Wide layout: names only, flowing into multiple columns (NC "Wide") ── */
+/* ── Wide layout: names only, flowing into whole columns (NC "Wide").
+   CSS multi-column sizes the list into a whole number of equal columns that
+   fill the panel width (3–4 depending on width, never a partial column), and
+   column-rule draws the vertical dividers between them. Obsidian's linter marks
+   multi-column "only partially supported", but it renders correctly on
+   Obsidian's Chromium and is the only clean way to get whole columns + dividers
+   (and the keyboard nav relies on the column layout), so the warning is
+   deliberately accepted here. ── */
 .nc-panel.nc-layout-wide .nc-colhead { display: none; }
 .nc-panel.nc-layout-wide .nc-list {
   flex: 1 1 0;        /* bound to the space between header and footer … */

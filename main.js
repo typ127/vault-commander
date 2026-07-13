@@ -403,8 +403,7 @@ class NCView extends ItemView {
     if (this._ssAnimFrame) { cancelAnimationFrame(this._ssAnimFrame); this._ssAnimFrame = null; }
     if (this._ssCanvas) { this._ssCanvas.remove(); this._ssCanvas = null; }
     document.body.classList.remove('nc-fs-active');
-    const leafEl = this.containerEl.closest('.workspace-leaf');
-    if (leafEl) leafEl.classList.remove('nc-fs');
+    this._clearFsLeaf();
   }
 
   focusView() { this.rootEl && this.rootEl.focus(); }
@@ -788,7 +787,11 @@ class NCView extends ItemView {
     const vaultFile = this.toVaultPath(full);
     if (vaultFile && /\.(md|canvas)$/i.test(en.name)) {
       const af = this.app.vault.getAbstractFileByPath(vaultFile);
-      if (af) { this.app.workspace.getLeaf(true).openFile(af); return; }
+      // leave fullscreen first: opening in a new tab restructures the tab group,
+      // which would strand the fixed-positioned commander (blank tab on return).
+      // Dropping to a normal tab avoids that; the observer only covers same-leaf
+      // re-layouts (e.g. mobile rotation), not tab-group changes.
+      if (af) { this.setFullscreen(false); this.app.workspace.getLeaf(true).openFile(af); return; }
     }
     this.actView();
   }
@@ -1195,7 +1198,9 @@ the bar at the bottom is clickable and always works.`);
     const vaultFile = this.toVaultPath(f.full);
     if (vaultFile && /\.(md|canvas)$/i.test(f.name)) {
       const af = this.app.vault.getAbstractFileByPath(vaultFile);
-      if (af) { this.app.workspace.getLeaf('tab').openFile(af); return; }
+      // leave fullscreen first (see openEntry) so returning to the commander tab
+      // shows it normally instead of a stranded, blank fixed-positioned leaf
+      if (af) { this.setFullscreen(false); this.app.workspace.getLeaf('tab').openFile(af); return; }
     }
 
     if (st.size > this.editLimit()) { new Notice(`File too large for the internal editor (max ${fmtSize(this.editLimit())}).`); return; }
@@ -2175,37 +2180,6 @@ the bar at the bottom is clickable and always works.`);
       this._ssAnimFrame = requestAnimationFrame(tick);
     };
 
-    // Electron desktop: capture real screenshot as background, then start worms on top.
-    // Obsidian plugin variants use the fake TV screen instead.
-    const isDesktopElectron = typeof window !== 'undefined' && window.__vc && !!window.__vc.nativeEditMenu;
-    if (isDesktopElectron) {
-      try {
-        const { ipcRenderer } = require('electron');
-        ipcRenderer.invoke('vc-capture').then(buf => {
-          if (!buf || this._ssCanvas !== canvas) return;
-          const blob = new Blob([buf], { type: 'image/png' });
-          const url = URL.createObjectURL(blob);
-          const img = new Image();
-          img.onload = () => {
-            URL.revokeObjectURL(url);
-            if (this._ssCanvas !== canvas) return;
-            ctx.drawImage(img, 0, 0, W, H);
-            startAnim();
-          };
-          img.onerror = () => {
-            URL.revokeObjectURL(url);
-            if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(); }
-          };
-          img.src = url;
-        }).catch(() => {
-          if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(); }
-        });
-      } catch (e) {
-        this._drawNCScreen(canvas);
-        startAnim();
-      }
-      return;
-    }
 
     this._drawNCScreen(canvas);
     startAnim();
@@ -2263,37 +2237,6 @@ the bar at the bottom is clickable and always works.`);
       this._ssAnimFrame = requestAnimationFrame(tick);
     };
 
-    // Electron desktop: use real screenshot as source image.
-    // Obsidian plugin variants use the fake TV screen instead.
-    const isDesktopElectron = typeof window !== 'undefined' && window.__vc && !!window.__vc.nativeEditMenu;
-    if (isDesktopElectron) {
-      try {
-        const { ipcRenderer } = require('electron');
-        ipcRenderer.invoke('vc-capture').then(buf => {
-          if (!buf || this._ssCanvas !== canvas) return;
-          const blob = new Blob([buf], { type: 'image/png' });
-          const url = URL.createObjectURL(blob);
-          const img = new Image();
-          img.onload = () => {
-            URL.revokeObjectURL(url);
-            if (this._ssCanvas !== canvas) return;
-            ctx.drawImage(img, 0, 0, W, H);
-            startAnim(ctx.getImageData(0, 0, W, H));
-          };
-          img.onerror = () => {
-            URL.revokeObjectURL(url);
-            if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(ctx.getImageData(0, 0, W, H)); }
-          };
-          img.src = url;
-        }).catch(() => {
-          if (this._ssCanvas === canvas) { this._drawNCScreen(canvas); startAnim(ctx.getImageData(0, 0, W, H)); }
-        });
-      } catch (e) {
-        this._drawNCScreen(canvas);
-        startAnim(ctx.getImageData(0, 0, W, H));
-      }
-      return;
-    }
 
     this._drawNCScreen(canvas);
     startAnim(ctx.getImageData(0, 0, W, H));
@@ -2409,7 +2352,7 @@ the bar at the bottom is clickable and always works.`);
     if (m.op === '-') r = v1 - v2;
     if (m.op === '*') r = v1 * v2;
     if (m.op === '/') {
-      if (v2 === 0) { m.disp = 'Error'; m.clearNext = true; return; }
+      if (v2 === 0) { m.disp = 'ERROR'; m.clearNext = true; return; }
       r = v1 / v2;
     }
     m.disp = String(Math.round(r * 1e8) / 1e8);
@@ -3405,12 +3348,92 @@ the bar at the bottom is clickable and always works.`);
   /* ── fullscreen: make the NC leaf fill the whole Obsidian window ── */
   setFullscreen(on) {
     // set the flag unconditionally so toggle/summon logic never desyncs, even if
-    // the leaf element isn't attached yet; apply the leaf class when it is.
+    // the leaf element isn't attached yet; apply the leaf styling when it is.
     this.fullscreen = !!on;
     document.body.classList.toggle('nc-fs-active', this.fullscreen);
-    const leafEl = this.containerEl.closest('.workspace-leaf');
-    if (leafEl) leafEl.classList.toggle('nc-fs', this.fullscreen);
+    if (this.fullscreen) {
+      this._bindFsReasserts();
+      this._applyFsLeaf();
+    } else {
+      this._clearFsLeaf();
+    }
     this.focusView();
+  }
+
+  // Fullscreen has to cover the whole window, which means positioning the *leaf*
+  // itself — never an element inside the view. Obsidian sets `contain: strict` on
+  // `.workspace-leaf`, which makes the leaf a containing block for any fixed-
+  // positioned descendant, so a fixed element inside the view can only ever fill
+  // the leaf, not the window.
+  //
+  // The leaf is Obsidian's, so we can't style it from our stylesheet without an
+  // `!important` (which the plugin review flags as a caution). Instead we set the
+  // positioning as inline styles on the leaf. Obsidian re-writes the leaf's inline
+  // style on any re-layout (mobile orientation change, tab switch), wiping ours —
+  // so we re-assert on every such signal (window resize/orientationchange +
+  // workspace resize/layout-change) and via a MutationObserver, each time
+  // re-resolving the leaf in case Obsidian swapped the element out.
+  _fsLeaf() { return this.containerEl.closest('.workspace-leaf'); }
+
+  _applyFsLeaf() {
+    const el = this._fsLeaf();
+    if (!el) return;
+    this._fsLeafEl = el;
+    el.classList.add('nc-fs');
+    // drop anything Obsidian's own layout may have set that would fight a full-
+    // window box (an explicit width/height for the split, an animation transform)…
+    el.style.width = '';
+    el.style.height = '';
+    el.style.transform = '';
+    // …then pin the leaf to the viewport.
+    el.style.position = 'fixed';
+    el.style.inset = '0';
+    el.style.zIndex = '100';
+    this._observeFsLeaf(el);
+  }
+
+  _clearFsLeaf() {
+    if (this._fsObserver) this._fsObserver.disconnect();
+    const el = this._fsLeafEl || this._fsLeaf();
+    if (el) {
+      el.classList.remove('nc-fs');
+      el.style.position = '';
+      el.style.inset = '';
+      el.style.zIndex = '';
+      el.style.transform = '';
+    }
+    this._fsLeafEl = null;
+  }
+
+  // re-apply the fullscreen box after Obsidian re-lays-out the leaf (orientation
+  // change, tab switch); a no-op unless we're actually fullscreen.
+  _reassertFs() { if (this.fullscreen) this._applyFsLeaf(); }
+
+  _observeFsLeaf(el) {
+    if (!this._fsObserver) {
+      this._fsObserver = new MutationObserver(() => {
+        // Obsidian rewrote the leaf's style; re-assert if it dropped our positioning.
+        if (this.fullscreen && this._fsLeafEl && this._fsLeafEl.style.position !== 'fixed') {
+          this._fsObserver.disconnect();   // don't observe our own write
+          this._applyFsLeaf();
+        }
+      });
+    } else {
+      this._fsObserver.disconnect();
+    }
+    this._fsObserver.observe(el, { attributes: true, attributeFilter: ['style'] });
+  }
+
+  // bind the relayout listeners once (auto-cleaned when the view unloads); each
+  // handler no-ops unless fullscreen, so it's safe to leave bound across toggles.
+  _bindFsReasserts() {
+    if (this._fsReassertsBound) return;
+    this._fsReassertsBound = true;
+    const reassert = () => this._reassertFs();
+    this.registerDomEvent(window, 'resize', reassert);
+    this.registerDomEvent(window, 'orientationchange', reassert);
+    this.registerEvent(this.app.workspace.on('resize', reassert));
+    this.registerEvent(this.app.workspace.on('layout-change', reassert));
   }
   toggleFullscreen() { this.setFullscreen(!this.fullscreen); }
 
@@ -3990,7 +4013,7 @@ class CopyModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; this.submitted = false; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     contentEl.createEl('h3', { text: 'Copy', cls: 'nc-modal-title' });
     const single = this.opts.count === 1;
     const dest = this.opts.destDir || '';
@@ -4044,7 +4067,7 @@ class ConfirmModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     if (this.opts.danger) modalEl.addClass('nc-modal-danger');
     contentEl.createEl('h3', { text: this.opts.title, cls: 'nc-modal-title' });
     contentEl.createEl(this.opts.nowrap ? 'div' : 'pre', { 
@@ -4082,7 +4105,7 @@ class PromptModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; this.submitted = false; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     contentEl.createEl('h3', { text: this.opts.title, cls: 'nc-modal-title' });
     const input = contentEl.createEl('input', { cls: 'nc-modal-input', attr: { type: 'text', spellcheck: 'false' } });
     input.value = this.opts.value || '';
@@ -4117,7 +4140,7 @@ class ConflictModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; this.decided = false; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     contentEl.createEl('h3', { text: (this.opts.mode === 'move' ? 'Move' : 'Copy') + ' — already exists', cls: 'nc-modal-title' });
     contentEl.createEl('pre', { text: `"${this.opts.name}" already exists in the target folder.`, cls: 'nc-modal-body' });
     const row = contentEl.createDiv({ cls: 'nc-modal-buttons nc-modal-buttons-wrap' });
@@ -4143,7 +4166,7 @@ class ConflictModal extends Modal {
 class EggModal extends Modal {
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal'); modalEl.addClass('nc-egg');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent'); modalEl.addClass('nc-egg');
     contentEl.createEl('h3', { text: '✦  X Y Z Z Y  ✦', cls: 'nc-modal-title' });
     const art =
 `☺ ☻ ☺ ☻ ☺ ☻ ☺ ☻ ☺ ☻ ☺
@@ -4173,7 +4196,7 @@ class ViewerModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; this._navFocus = null; this._navBusy = false; }
   onOpen() {
     const { modalEl } = this;
-    modalEl.addClass('nc-modal'); modalEl.addClass('nc-viewer');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent'); modalEl.addClass('nc-viewer');
     // a paged viewer (Prev/Next/Close) gets its own button colouring: the
     // focused (“selected”) button is green, the others sit black.
     if (this.opts.nav) modalEl.addClass('nc-viewer-paged');
@@ -4416,7 +4439,7 @@ class DriveModal extends Modal {
   constructor(app, vols, onPick) { super(app); this.vols = vols; this.onPick = onPick; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     contentEl.createEl('h3', { text: 'Drive / Volume', cls: 'nc-modal-title' });
     const list = contentEl.createDiv({ cls: 'nc-drive-list' });
     for (const v of this.vols) {
@@ -4431,7 +4454,7 @@ class HotlistModal extends Modal {
   constructor(app, opts) { super(app); this.opts = opts; this.sel = 0; }
   onOpen() {
     const { contentEl, modalEl } = this;
-    modalEl.addClass('nc-modal');
+    modalEl.addClass('nc-modal'); this.containerEl.addClass('nc-modal-parent');
     contentEl.createEl('h3', { text: 'Bookmarks', cls: 'nc-modal-title' });
     this.listWrap = contentEl.createDiv({ cls: 'nc-hotlist' });
     // keyboard hint only on desktop; mobile uses tap + the per-row ✕ button

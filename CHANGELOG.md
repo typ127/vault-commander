@@ -4,6 +4,28 @@ All notable changes to **Vault Commander** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026-07-13
+
+Patch release — a fullscreen fix and plugin-review cleanups.
+
+### Fixed
+- **Fullscreen commander no longer disappears** on mobile after an orientation
+  change (portrait ↔ landscape), or when returning to its tab on desktop. Its
+  full-window positioning is now re-asserted whenever Obsidian re-lays-out the
+  pane.
+- **Calculator** shows `ERROR` (uppercase) for division by zero.
+
+### Changed
+- **Opening or editing a Markdown/Canvas file from a fullscreen commander now
+  exits fullscreen** as the file opens (re-trigger the fullscreen hotkey to go
+  back), so the commander tab is never left blank behind the editor.
+- **Plugin-review cleanups, no visible change.** Removed all CSS `!important`
+  rules and the `:has()` selector (re-implemented via specificity and a small
+  class toggle), dropped two unsupported CSS features (`ui-monospace`,
+  `scrollbar-width`), and stopped bundling desktop-only Electron code in the
+  community build — clearing the corresponding review warnings. The multi-column
+  "Wide" layout still uses CSS columns, which remains an advisory-only note.
+
 ## [1.1.1] — 2026-07-12
 
 Patch release — internal cleanups, no behavior change.
@@ -69,5 +91,6 @@ retro tools and games — plus a round of correctness fixes.
   and is cancelled as soon as you move on — so pointing the other panel at a huge
   directory tree no longer hangs the app.
 
+[1.1.2]: https://github.com/typ127/vault-commander/compare/1.1.1...1.1.2
 [1.1.1]: https://github.com/typ127/vault-commander/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/typ127/vault-commander/compare/1.0.0...1.1.0
